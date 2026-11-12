@@ -160,20 +160,28 @@ function recognize(p) {
   if (len < 15) return null;
   const ax = p[0], ay = p[1], bx = p[p.length - 3], by = p[p.length - 2];
   const chord = Math.hypot(bx - ax, by - ay);
-  if (chord / len > 0.88) {
+  if (chord / len > 0.86) {
     let ex = bx, ey = by;
     if (Math.abs(by - ay) / chord < 0.06) ey = ay;          // snap near-horizontal
     else if (Math.abs(bx - ax) / chord < 0.06) ex = ax;     // snap near-vertical
     return [ax, ay, 0.5, ex, ey, 0.5];
   }
-  if (chord / len < 0.25) {
+  if (chord / len < 0.3) {
     const b = ptsBox(p, 3);
     const cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2;
     let rx = (b.x1 - b.x0) / 2, ry = (b.y1 - b.y0) / 2;
     if (rx < 4 || ry < 4) return null;
     let err = 0;
     for (let i = 0; i < p.length; i += 3) err += Math.abs(Math.hypot((p[i] - cx) / rx, (p[i + 1] - cy) / ry) - 1);
-    if (err / n > 0.1) return null;
+    if (err / n > 0.15) return null;
+    // Must actually go most of the way round, so a "C" or "U" isn't turned into a circle.
+    let turn = 0;
+    for (let i = 3; i < p.length; i += 3) {
+      let d = Math.atan2(p[i + 1] - cy, p[i] - cx) - Math.atan2(p[i - 2] - cy, p[i - 3] - cx);
+      if (d > Math.PI) d -= 2 * Math.PI; else if (d < -Math.PI) d += 2 * Math.PI;
+      turn += d;
+    }
+    if (Math.abs(turn) < Math.PI * 1.6) return null;
     if (Math.abs(rx - ry) / Math.max(rx, ry) < 0.18) rx = ry = (rx + ry) / 2;
     const out = [], steps = 72;
     for (let i = 0; i <= steps; i++) {
@@ -392,11 +400,11 @@ class Editor {
     this.prefs = host.prefs;
     this.nb = newNotebook(this.prefs);
     this.pageIndex = 0;
-    this.scale = 1; this.tx = 0; this.ty = 0; this.res = 0; this.ready = false;
+    this.scale = 1; this.tx = 0; this.ty = 0; this.ready = false;
     this.act = null;                  // pen / mouse action in progress
     this.touches = new Map();         // fingers currently used for a gesture
     this.gesture = null;
-    this.sel = new Set(); this.selBox = null; this.selDx = 0; this.selDy = 0;
+    this.sel = new Set(); this.selBox = null; this.selM = null;   // selM: live move/scale/rotate matrix
     this.undoStack = []; this.redoStack = [];
     this.liveQueued = false; this.resTimer = 0;
     this.rect = { left: 0, top: 0 };
@@ -408,9 +416,13 @@ class Editor {
     this.root.tabIndex = -1;
     this.toolbar = el('div', 'inkbook-toolbar', this.root);
     this.stage = el('div', 'inkbook-stage', this.root);
-    this.pageEl = el('div', 'inkbook-page', this.stage);
-    this.main = el('canvas', '', this.pageEl);
-    this.live = el('canvas', '', this.pageEl);
+    // viewEl carries page-turn slides; pageEl is the paper itself (shadow, colour, true position);
+    // the canvases cover the visible area and are drawn at the screen's real pixel density.
+    this.viewEl = el('div', 'inkbook-view', this.stage);
+    this.pageEl = el('div', 'inkbook-page', this.viewEl);
+    this.main = el('canvas', 'inkbook-layer', this.viewEl);
+    this.live = el('canvas', 'inkbook-layer', this.viewEl);
+    this.rv = null;                   // the view the canvases were last drawn for
     this.hint = el('div', 'inkbook-hint', this.stage);
     this.selBar = el('div', 'inkbook-selbar', this.stage);
     this.buildToolbar();
@@ -441,6 +453,7 @@ class Editor {
 
   destroy() {
     this.ro.disconnect();
+    this.closeColors();
     clearTimeout(this.resTimer);
     if (this.act && this.act.timer) clearTimeout(this.act.timer);
     this.root.remove();
@@ -454,7 +467,7 @@ class Editor {
     this.pageIndex = clamp(this.pageIndex, 0, nb.pages.length - 1);
     this.undoStack = []; this.redoStack = [];
     this.act = null; this.dropSelection();
-    if (resized) { this.ready = false; this.res = 0; }
+    if (resized) { this.ready = false; this.rv = null; }
     this.layout();
     this.renderMain(); this.clearLive();
     this.refreshToolbar();
@@ -497,20 +510,15 @@ class Editor {
     const p = this.prefs, tool = p.tool;
     for (const k in this.toolBtns) this.toolBtns[k].classList.toggle('is-active', k === tool);
 
+    // One swatch showing the current colour; tapping it opens a small popup with the rest.
     this.palette.textContent = '';
+    this.closeColors();
     if (tool !== 'eraser') {
       const hl = tool === 'highlighter', cur = hl ? p.hlColor : p.penColor;
-      const colors = hl ? HL_COLORS : PEN_COLORS;
-      for (const c of colors) {
-        const b = el('button', 'inkbook-swatch' + (c === cur ? ' is-active' : ''), this.palette);
-        b.style.backgroundColor = c;
-        b.setAttribute('aria-label', 'Colour');
-        b.addEventListener('click', () => this.setColor(c));
-      }
-      const custom = el('input', 'inkbook-swatch inkbook-custom' + (colors.includes(cur) ? '' : ' is-active'), this.palette);
-      custom.type = 'color'; custom.value = cur;
-      custom.setAttribute('aria-label', 'Custom colour');
-      custom.addEventListener('change', () => this.setColor(custom.value));
+      const b = el('button', 'inkbook-swatch is-current', this.palette);
+      b.style.backgroundColor = cur;
+      b.setAttribute('aria-label', 'Colour');
+      b.addEventListener('click', (e) => { e.preventDefault(); this.colorPop ? this.closeColors() : this.openColors(b); });
     }
 
     this.sizes.textContent = '';
@@ -526,6 +534,33 @@ class Editor {
       });
     }
     this.refreshState();
+  }
+
+  openColors(anchor) {
+    const p = this.prefs, hl = p.tool === 'highlighter', cur = hl ? p.hlColor : p.penColor;
+    const colors = hl ? HL_COLORS : PEN_COLORS;
+    const pop = this.colorPop = el('div', 'inkbook-colorpop', this.root);
+    for (const c of colors) {
+      const b = el('button', 'inkbook-swatch' + (c === cur ? ' is-active' : ''), pop);
+      b.style.backgroundColor = c;
+      b.setAttribute('aria-label', 'Colour');
+      b.addEventListener('click', () => this.setColor(c));
+    }
+    const custom = el('input', 'inkbook-swatch inkbook-custom' + (colors.includes(cur) ? '' : ' is-active'), pop);
+    custom.type = 'color'; custom.value = cur;
+    custom.setAttribute('aria-label', 'Custom colour');
+    custom.addEventListener('change', () => this.setColor(custom.value));
+    const r = anchor.getBoundingClientRect(), rr = this.root.getBoundingClientRect();
+    pop.style.top = r.bottom - rr.top + 6 + 'px';
+    pop.style.left = clamp(r.left - rr.left - 8, 4, Math.max(4, rr.width - pop.offsetWidth - 4)) + 'px';
+    this.popOff = (e) => { if (!pop.contains(e.target) && !anchor.contains(e.target)) this.closeColors(); };
+    setTimeout(() => document.addEventListener('pointerdown', this.popOff, true));
+  }
+
+  closeColors() {
+    if (!this.colorPop) return;
+    this.colorPop.remove(); this.colorPop = null;
+    document.removeEventListener('pointerdown', this.popOff, true);
   }
 
   refreshState() {
@@ -574,7 +609,7 @@ class Editor {
       { title: 'Export notebook as PDF', icon: 'file-down', click: () => this.exportPdf() },
       { title: 'Export this page as PNG', icon: 'image', click: () => this.exportPng() },
       '-',
-      { title: 'Zoom to fit', icon: 'maximize', click: () => { this.fit(); this.applyTransform(); this.ensureRes(); } },
+      { title: 'Zoom to fit', icon: 'maximize', click: () => { this.fit(); this.applyTransform(); this.render(); } },
       { title: 'Clear page', icon: 'eraser', click: () => this.clearPage() },
       { title: 'Delete page', icon: 'trash-2', click: () => this.deletePage() },
       '-',
@@ -592,7 +627,7 @@ class Editor {
     this.pageEl.style.width = this.nb.w + 'px';
     this.pageEl.style.height = this.nb.h + 'px';
     if (!this.ready) { this.ready = true; this.fit(); }
-    this.clampPan(); this.applyTransform(); this.ensureRes();
+    this.clampPan(); this.applyTransform(); this.render();
   }
 
   fit() {
@@ -618,13 +653,24 @@ class Editor {
     this.ty = clamp(this.ty, r.y[0], r.y[1]);
   }
 
-  transformCss(extra) {
-    return `translate(${this.tx + (extra || 0)}px,${this.ty}px) scale(${this.scale})`;
+  /* Slide offset for page turns (applied to the whole view, paper and ink together). */
+  slideCss(extra) {
+    return extra ? `translateX(${extra}px)` : 'none';
   }
 
+  /* The paper moves to the new view at once; the ink canvases, drawn for an earlier view, are
+     stretched to match by CSS until render() redraws them sharply for the new view. */
   applyTransform(extra) {
-    this.pageEl.style.transform = this.transformCss(extra);
+    this.viewEl.style.transform = this.slideCss(extra);
+    this.pageEl.style.transform = `translate(${this.tx}px,${this.ty}px) scale(${this.scale})`;
+    const v = this.rv;
+    if (v) {
+      const k = this.scale / v.s;
+      const t = `translate(${this.tx - v.tx * k}px,${this.ty - v.ty * k}px) scale(${k})`;
+      this.main.style.transform = this.live.style.transform = t;
+    }
     this.placeSelBar();
+    if (v && (v.s !== this.scale || v.tx !== this.tx || v.ty !== this.ty)) this.renderSoon();
   }
 
   zoomAt(cx, cy, s) {
@@ -633,39 +679,64 @@ class Editor {
     s = clamp(s, min, 8);
     const px = (cx - this.tx) / this.scale, py = (cy - this.ty) / this.scale;
     this.scale = s; this.tx = cx - px * s; this.ty = cy - py * s;
-    this.clampPan(); this.applyTransform(); this.resSoon();
+    this.clampPan(); this.applyTransform();
   }
 
-  /* Canvas resolution follows zoom (re-rendered once the zoom settles) so ink stays crisp. */
-  resSoon() {
+  /* Redraw sharply once panning / zooming pauses. */
+  renderSoon() {
     clearTimeout(this.resTimer);
-    this.resTimer = setTimeout(() => {
-      if (this.act || this.gesture) this.resSoon(); else this.ensureRes();
-    }, 160);
+    this.resTimer = setTimeout(() => { if (this.act) this.renderSoon(); else this.render(); }, 90);
   }
 
-  ensureRes() {
-    const nb = this.nb, dpr = window.devicePixelRatio || 1;
-    const want = Math.min(this.scale * dpr, Math.sqrt(MAX_CANVAS_PX / (nb.w * nb.h)));
-    if (this.res && Math.abs(want - this.res) / this.res < 0.04) return;
-    this.res = want;
-    for (const c of [this.main, this.live]) { c.width = Math.round(nb.w * want); c.height = Math.round(nb.h * want); }
+  /* Sizes the canvases to the visible area (plus a margin so a short pan shows ink straight away)
+     at device pixel density, and draws everything for the current view. */
+  render() {
+    clearTimeout(this.resTimer);
+    const cw = this.stage.clientWidth, ch = this.stage.clientHeight;
+    if (!cw || !ch) return;
+    const mx = Math.round(cw * 0.15), my = Math.round(ch * 0.15);
+    const W = cw + 2 * mx, H = ch + 2 * my;
+    const k = Math.min(window.devicePixelRatio || 1, Math.sqrt(MAX_CANVAS_PX / (W * H)));
+    const pw = Math.round(W * k), ph = Math.round(H * k);
+    for (const c of [this.main, this.live]) {
+      if (c.width !== pw || c.height !== ph) { c.width = pw; c.height = ph; }
+      c.style.left = -mx + 'px'; c.style.top = -my + 'px';
+      c.style.width = W + 'px'; c.style.height = H + 'px';
+      c.style.transformOrigin = `${mx}px ${my}px`;
+      c.style.transform = 'none';
+    }
+    this.rv = { tx: this.tx, ty: this.ty, s: this.scale, k: pw / W, mx, my };
     this.renderMain(); this.paintLive();
   }
 
   ctxOf(canvas) {
-    const ctx = canvas.getContext('2d');
-    ctx.setTransform(this.res, 0, 0, this.res, 0, 0);
+    const ctx = canvas.getContext('2d'), v = this.rv, f = v.k * v.s;
+    ctx.setTransform(f, 0, 0, f, v.k * (v.mx + v.tx), v.k * (v.my + v.ty));
     return ctx;
   }
 
   /* ---------------- painting ---------------- */
 
   renderMain() {
-    if (!this.res) return;
-    const ctx = this.ctxOf(this.main), page = this.page;
-    drawTemplate(ctx, this.nb, page);
-    for (const s of page.strokes) if (!this.sel.has(s)) drawStroke(ctx, s);
+    if (!this.rv) return;
+    const nb = this.nb, page = this.page;
+    this.pageEl.style.background = (PAPERS[nb.paper] || PAPERS.white).bg;
+    const raw = this.main.getContext('2d');
+    raw.setTransform(1, 0, 0, 1, 0, 0);
+    raw.clearRect(0, 0, this.main.width, this.main.height);
+    const ctx = this.ctxOf(this.main);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0, 0, nb.w, nb.h); ctx.clip();
+    drawTemplate(ctx, nb, page);
+    const v = this.rv, W = this.main.width / v.k, H = this.main.height / v.k;   // skip off-screen ink
+    const x0 = (-v.mx - v.tx) / v.s, y0 = (-v.my - v.ty) / v.s, x1 = x0 + W / v.s, y1 = y0 + H / v.s;
+    for (const s of page.strokes) {
+      if (this.sel.has(s)) continue;
+      const b = strokeBox(s);
+      if (b.x1 < x0 || b.x0 > x1 || b.y1 < y0 || b.y0 > y1) continue;
+      drawStroke(ctx, s);
+    }
+    ctx.restore();
   }
 
   clearLive() {
@@ -681,19 +752,28 @@ class Editor {
   }
 
   paintLive() {
-    if (!this.res) return;
+    if (!this.rv) return;
     const a = this.act;
     if (a && a.type === 'stroke') return this.paintLiveStroke(a);
     this.clearLive();
-    const ctx = this.ctxOf(this.live), px = 1 / this.scale;
+    const ctx = this.ctxOf(this.live), px = 1 / this.rv.s;
     if (this.sel.size && this.selBox) {
-      const b = this.selBox;
+      const M = this.selM;
       ctx.save();
-      ctx.translate(this.selDx, this.selDy);
+      if (M) ctx.transform(M[0], M[1], M[2], M[3], M[4], M[5]);
       for (const s of this.page.strokes) if (this.sel.has(s)) drawStroke(ctx, s);
-      ctx.strokeStyle = '#3b82f6'; ctx.lineWidth = 1.2 * px; ctx.setLineDash([5 * px, 4 * px]);
-      ctx.strokeRect(b.x0 - 4 * px, b.y0 - 4 * px, b.x1 - b.x0 + 8 * px, b.y1 - b.y0 + 8 * px);
       ctx.restore();
+      // Frame and handles are drawn untransformed so they keep a constant on-screen size.
+      const f = this.selFrame(), c = f.corners;
+      ctx.strokeStyle = '#3b82f6'; ctx.lineWidth = 1.2 * px; ctx.setLineDash([5 * px, 4 * px]);
+      ctx.beginPath(); ctx.moveTo(c[0][0], c[0][1]);
+      for (let i = 1; i < 4; i++) ctx.lineTo(c[i][0], c[i][1]);
+      ctx.closePath(); ctx.stroke(); ctx.setLineDash([]);
+      ctx.beginPath(); ctx.moveTo(f.top[0], f.top[1]); ctx.lineTo(f.rot[0], f.rot[1]); ctx.stroke();
+      ctx.fillStyle = '#fff'; ctx.lineWidth = 1.5 * px;
+      for (const q of c.concat([f.rot])) {
+        ctx.beginPath(); ctx.arc(q[0], q[1], 6 * px, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      }
     }
     if (a && a.type === 'lasso') {
       ctx.strokeStyle = '#3b82f6'; ctx.lineWidth = 1.4 * px; ctx.setLineDash([5 * px, 4 * px]);
@@ -717,7 +797,7 @@ class Editor {
       const b = a.box;
       ctx.clearRect(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0);
     }
-    const b = ptsBox(p, 3), m = s.w * 2 + 2 / this.res;
+    const b = ptsBox(p, 3), m = s.w * 2 + 2 / (this.rv.k * this.rv.s);
     a.box = { x0: b.x0 - m, y0: b.y0 - m, x1: b.x1 + m, y1: b.y1 + m };
     ctx.save();
     drawStroke(ctx, tmp);
@@ -730,7 +810,9 @@ class Editor {
      model's tx/ty, so any outside offset — scrolled containers, sidebars, a running animation,
      Obsidian's own zoom — can't make ink land away from the pencil tip. */
   measureOrigin() {
-    if (this.pageEl.getAnimations) for (const an of this.pageEl.getAnimations()) an.finish();
+    if (this.viewEl.getAnimations) for (const an of this.viewEl.getAnimations()) an.finish();
+    const v = this.rv;
+    if (!v || v.s !== this.scale || v.tx !== this.tx || v.ty !== this.ty) this.render();   // sharp before writing
     const r = this.pageEl.getBoundingClientRect();
     const k = r.width > 0 ? r.width / this.nb.w : this.scale;
     this.origin = { x: r.left, y: r.top, k };
@@ -864,7 +946,7 @@ class Editor {
       this.scale = s;
       this.tx = c.x - ((g.cx - g.tx) / g.scale) * s;
       this.ty = c.y - ((g.cy - g.ty) / g.scale) * s;
-      this.clampPan(); this.applyTransform(); this.resSoon();
+      this.clampPan(); this.applyTransform();
       return;
     }
     const dx = c.x - g.cx, dy = c.y - g.cy;
@@ -900,7 +982,7 @@ class Editor {
     else if (dx > 70 && this.pageIndex > 0) this.goTo(this.pageIndex - 1, -1);
     else {
       this.applyTransform();
-      if (this.pageEl.animate) this.pageEl.animate([{ transform: this.transformCss(g.swipe) }, { transform: this.transformCss() }], { duration: 140, easing: 'ease-out' });
+      if (this.viewEl.animate) this.viewEl.animate([{ transform: this.slideCss(g.swipe) }, { transform: 'none' }], { duration: 140, easing: 'ease-out' });
     }
   }
 
@@ -915,8 +997,18 @@ class Editor {
       this.eraseAlong(x, y, x, y);
       this.queueLive();
     } else if (tool === 'lasso') {
-      if (this.sel.size && this.inSelBox(x, y)) {
-        this.act = { type: 'move', id, touch, x0: x, y0: y };
+      const h = this.sel.size ? this.selHandleAt(x, y) : null;
+      if (h || (this.sel.size && this.inSelBox(x, y))) {
+        const b = this.selBox, f = this.selFrame();
+        const act = { type: 'move', id, touch, x0: x, y0: y };
+        if (h === 'rot') {
+          Object.assign(act, { type: 'rotate', cx: (b.x0 + b.x1) / 2, cy: (b.y0 + b.y1) / 2 });
+          act.a0 = Math.atan2(y - act.cy, x - act.cx);
+        } else if (h !== null && h !== undefined) {
+          const fx = f.corners[(h + 2) % 4], cx = f.corners[h];  // scale about the opposite corner
+          Object.assign(act, { type: 'scale', fx: fx[0], fy: fx[1], vx: cx[0] - fx[0], vy: cx[1] - fx[1] });
+        }
+        this.act = act;
         this.selBar.style.display = 'none';
       } else {
         this.clearSelection();
@@ -946,7 +1038,18 @@ class Editor {
       const [x, y] = this.toPage(e);
       if (a.type === 'erase') { this.eraseAlong(a.x, a.y, x, y); a.x = x; a.y = y; }
       else if (a.type === 'lasso') a.pts.push(x, y);
-      else if (a.type === 'move') { this.selDx = x - a.x0; this.selDy = y - a.y0; }
+      else if (a.type === 'move') this.selM = [1, 0, 0, 1, x - a.x0, y - a.y0];
+      else if (a.type === 'scale') {
+        const l2 = a.vx * a.vx + a.vy * a.vy;
+        const k = Math.max(0.05, ((x - a.fx) * a.vx + (y - a.fy) * a.vy) / (l2 || 1));
+        this.selM = [k, 0, 0, k, a.fx - k * a.fx, a.fy - k * a.fy];
+      } else if (a.type === 'rotate') {
+        let t = Math.atan2(y - a.cy, x - a.cx) - a.a0;
+        const q = Math.PI / 2, near = Math.round(t / q) * q;   // click to 0 / 90 / 180 / 270 degrees
+        if (Math.abs(t - near) < 0.07) t = near;
+        const c = Math.cos(t), s = Math.sin(t);
+        this.selM = [c, s, -s, c, a.cx - c * a.cx + s * a.cy, a.cy - s * a.cx - c * a.cy];
+      }
     }
     this.queueLive();
   }
@@ -957,7 +1060,7 @@ class Editor {
       if (a.snapped.length === 6) { a.snapped[3] = r2(x); a.snapped[4] = r2(y); }
       return;
     }
-    if (Math.hypot(x - a.ax, y - a.ay) > 4 / this.scale) { a.ax = x; a.ay = y; this.armHold(a); }
+    if (Math.hypot(x - a.ax, y - a.ay) > 7 / this.scale) { a.ax = x; a.ay = y; this.armHold(a); }
     const k = 1 - clamp(this.prefs.stabilize, 0, 0.9);  // stabiliser: ink trails the pen slightly
     a.sx += (x - a.sx) * k; a.sy += (y - a.sy) * k; a.sp += (pr - a.sp) * k;
     const p = a.s.p, n = p.length;
@@ -972,7 +1075,7 @@ class Editor {
       if (this.act !== a || a.snapped) return;
       const r = recognize(a.s.p.concat([r2(a.rx), r2(a.ry), a.sp]));
       if (r) { a.snapped = r; this.queueLive(); }
-    }, 500);
+    }, 400);
   }
 
   cancelAct() {
@@ -980,7 +1083,7 @@ class Editor {
     this.act = null;
     if (!a) return;
     clearTimeout(a.timer);
-    if (a.type === 'move') { this.selDx = this.selDy = 0; this.placeSelBar(); }
+    if (a.type === 'move' || a.type === 'scale' || a.type === 'rotate') { this.selM = null; this.placeSelBar(); }
     if (a.type === 'erase' && a.changed) this.changed();
     this.paintLive();
   }
@@ -1025,15 +1128,19 @@ class Editor {
         }
         if (set.size) this.select(set);
       }
-    } else if (a.type === 'move') {
-      const dx = this.selDx, dy = this.selDy;
-      this.selDx = this.selDy = 0;
-      if (dx || dy) {
+    } else if (a.type === 'move' || a.type === 'scale' || a.type === 'rotate') {
+      const M = this.selM;
+      this.selM = null;
+      if (M && (M[0] !== 1 || M[1] !== 0 || M[2] !== 0 || M[3] !== 1 || M[4] || M[5])) {
+        const k = Math.sqrt(Math.abs(M[0] * M[3] - M[1] * M[2]));   // resizing scales line width too
         this.pushHistory();
         this.transformSel((s) => {
           const q = s.p.slice();
-          for (let i = 0; i < q.length; i += 3) { q[i] = r2(q[i] + dx); q[i + 1] = r2(q[i + 1] + dy); }
-          return Object.assign({}, s, { p: q });
+          for (let i = 0; i < q.length; i += 3) {
+            const x = q[i], y = q[i + 1];
+            q[i] = r2(M[0] * x + M[2] * y + M[4]); q[i + 1] = r2(M[1] * x + M[3] * y + M[5]);
+          }
+          return Object.assign({}, s, { p: q, w: Math.max(0.2, r2(s.w * k)) });
         });
         this.changed();
       }
@@ -1079,19 +1186,41 @@ class Editor {
     this.selBox = b;
   }
 
+  /* Selection frame in page coordinates (with any drag in progress applied): corners in the order
+     top-left, top-right, bottom-right, bottom-left; `top` is the top-edge midpoint, `rot` the
+     rotate handle above it. */
+  selFrame() {
+    const b = this.selBox, M = this.selM || [1, 0, 0, 1, 0, 0], pad = 6 / this.scale;
+    const tf = (x, y) => [M[0] * x + M[2] * y + M[4], M[1] * x + M[3] * y + M[5]];
+    const x0 = b.x0 - pad, y0 = b.y0 - pad, x1 = b.x1 + pad, y1 = b.y1 + pad;
+    const corners = [tf(x0, y0), tf(x1, y0), tf(x1, y1), tf(x0, y1)];
+    const top = tf((x0 + x1) / 2, y0), bot = tf((x0 + x1) / 2, y1);
+    const ux = top[0] - bot[0], uy = top[1] - bot[1], ul = Math.hypot(ux, uy) || 1, d = 26 / this.scale;
+    return { corners, top, rot: [top[0] + (ux / ul) * d, top[1] + (uy / ul) * d] };
+  }
+
+  /* 0-3 for a corner (resize), 'rot' for the rotate handle, or null. */
+  selHandleAt(x, y) {
+    if (!this.selBox) return null;
+    const f = this.selFrame(), r = 18 / this.scale;
+    if (Math.hypot(x - f.rot[0], y - f.rot[1]) < r) return 'rot';
+    for (let i = 0; i < 4; i++) if (Math.hypot(x - f.corners[i][0], y - f.corners[i][1]) < r) return i;
+    return null;
+  }
+
   inSelBox(x, y) {
     const b = this.selBox, m = 8 / this.scale;
     return !!b && x >= b.x0 - m && x <= b.x1 + m && y >= b.y0 - m && y <= b.y1 + m;
   }
 
   select(set) {
-    this.sel = set; this.selDx = this.selDy = 0;
+    this.sel = set; this.selM = null;
     this.computeSelBox();
     this.renderMain(); this.queueLive(); this.placeSelBar();
   }
 
   dropSelection() {
-    this.sel = new Set(); this.selBox = null; this.selDx = this.selDy = 0;
+    this.sel = new Set(); this.selBox = null; this.selM = null;
     this.selBar.style.display = 'none';
   }
 
@@ -1113,12 +1242,14 @@ class Editor {
 
   placeSelBar() {
     const bar = this.selBar, b = this.selBox;
-    if (!b || !this.sel.size || (this.act && this.act.type === 'move')) { bar.style.display = 'none'; return; }
+    const busy = this.act && (this.act.type === 'move' || this.act.type === 'scale' || this.act.type === 'rotate');
+    if (!b || !this.sel.size || busy) { bar.style.display = 'none'; return; }
     bar.style.display = 'flex';
     const cw = this.stage.clientWidth, ch = this.stage.clientHeight, bw = bar.offsetWidth || 150, bh = bar.offsetHeight || 40;
     const x = this.tx + ((b.x0 + b.x1) / 2) * this.scale - bw / 2;
-    let y = this.ty + b.y0 * this.scale - bh - 12;
-    if (y < 6) y = this.ty + b.y1 * this.scale + 12;
+    // Below the selection (the rotate handle sits above it); above if there is no room below.
+    let y = this.ty + b.y1 * this.scale + 18;
+    if (y + bh > ch - 6) y = this.ty + b.y0 * this.scale - bh - 44;
     bar.style.left = clamp(x, 6, Math.max(6, cw - bw - 6)) + 'px';
     bar.style.top = clamp(y, 6, Math.max(6, ch - bh - 6)) + 'px';
   }
@@ -1202,10 +1333,10 @@ class Editor {
     this.pageIndex = i;
     this.ty = 12; this.clampPan();
     this.applyTransform();
-    this.renderMain(); this.clearLive(); this.refreshState();
-    if (dir && this.pageEl.animate) {
-      this.pageEl.animate(
-        [{ transform: this.transformCss(dir * 90), opacity: 0.3 }, { transform: this.transformCss(), opacity: 1 }],
+    this.render(); this.clearLive(); this.refreshState();
+    if (dir && this.viewEl.animate) {
+      this.viewEl.animate(
+        [{ transform: this.slideCss(dir * 90), opacity: 0.3 }, { transform: 'none', opacity: 1 }],
         { duration: 170, easing: 'ease-out' });
     }
   }
