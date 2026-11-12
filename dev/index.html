@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Inkbook test harness</title>
+<link rel="stylesheet" href="../styles.css">
+<style>
+  html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; }
+  #app { height: 100%; }
+  .menu { position: fixed; background: #fff; border-radius: 8px; box-shadow: 0 4px 18px rgba(0,0,0,.3); padding: 4px; z-index: 99; font-size: 14px; }
+  .menu div { padding: 6px 14px; border-radius: 5px; cursor: pointer; white-space: nowrap; }
+  .menu div:hover { background: #eee; }
+  .menu hr { border: none; border-top: 1px solid #ddd; margin: 4px 0; }
+  .inkbook-btn { font-size: 10px; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+  // Stand-ins for the Obsidian API so main.js loads in a plain browser. Not used by the real plugin.
+  var module = { exports: {} };
+  function require() {
+    return { Plugin: class {}, TextFileView: class {}, Modal: class {}, PluginSettingTab: class {} };
+  }
+</script>
+<script src="../main.js"></script>
+<script>
+  const Plugin = module.exports, T = Plugin.internals;
+  const KEY = 'inkbook-dev';
+  const prefs = Object.assign({}, T.DEFAULT_PREFS);
+  let clip = null;
+  window.saved = [];
+  const host = {
+    prefs,
+    savePrefs() {},
+    changed() { localStorage.setItem(KEY, JSON.stringify(editor.nb)); },
+    setIcon(el, names) { el.textContent = names.split('|')[0].slice(0, 5); },
+    menu(items, evt) {
+      const m = document.createElement('div'); m.className = 'menu';
+      for (const it of items) {
+        if (it === '-') { m.appendChild(document.createElement('hr')); continue; }
+        const d = document.createElement('div');
+        d.textContent = (it.checked ? '✓ ' : '') + it.title;
+        d.onclick = () => { m.remove(); it.click(); };
+        m.appendChild(d);
+      }
+      document.body.appendChild(m);
+      m.style.left = Math.min(evt.clientX, innerWidth - m.offsetWidth - 8) + 'px';
+      m.style.top = evt.clientY + 'px';
+      setTimeout(() => addEventListener('pointerdown', (e) => { if (!m.contains(e.target)) m.remove(); }, { once: true }));
+    },
+    notice(t) { console.log('[notice]', t); },
+    confirm(t) { return Promise.resolve(confirm(t)); },
+    getClipboard() { return clip; },
+    setClipboard(s) { clip = s; },
+    async saveFile(suffix, buffer, mime) {
+      window.saved.push({ suffix, buffer, mime });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([buffer], { type: mime }));
+      a.download = 'notebook' + suffix;
+      if (!window.noDownload) a.click();
+    },
+  };
+  const editor = window.editor = new Plugin.Editor(document.getElementById('app'), host);
+  editor.load(T.parseNotebook(localStorage.getItem(KEY) || '', prefs));
+</script>
+</body>
+</html>

@@ -1,0 +1,178 @@
+.inkbook-content {
+  padding: 0 !important;
+  overflow: hidden !important;
+}
+
+.inkbook-error {
+  padding: 24px;
+  color: var(--text-error, #c00);
+}
+
+.inkbook-root {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  outline: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.inkbook-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--background-modifier-border, #dcdce0);
+  background: var(--background-primary, #fff);
+}
+
+.inkbook-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.inkbook-group:empty {
+  display: none;
+}
+
+.inkbook-spacer {
+  flex: 1;
+}
+
+.inkbook-root button.inkbook-btn {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-muted, #555);
+  cursor: pointer;
+}
+
+.inkbook-root button.inkbook-btn:hover {
+  background: var(--background-modifier-hover, rgba(0, 0, 0, 0.07));
+}
+
+.inkbook-root button.inkbook-btn.is-active {
+  background: var(--interactive-accent, #6d5ae6);
+  color: var(--text-on-accent, #fff);
+}
+
+.inkbook-root button.inkbook-btn:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+.inkbook-dot {
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.inkbook-root .inkbook-swatch {
+  width: 24px;
+  height: 24px;
+  min-width: 24px;
+  margin: 0 3px;
+  padding: 0;
+  border-radius: 50%;
+  border: 2px solid var(--background-primary, #fff);
+  box-shadow: 0 0 0 1px var(--background-modifier-border, #c8c8cf);
+  cursor: pointer;
+}
+
+.inkbook-root .inkbook-swatch.is-active {
+  box-shadow: 0 0 0 2px var(--interactive-accent, #6d5ae6);
+}
+
+.inkbook-root input.inkbook-custom {
+  -webkit-appearance: none;
+  appearance: none;
+  overflow: hidden;
+  background: conic-gradient(#f43f5e, #f59e0b, #22c55e, #06b6d4, #6366f1, #d946ef, #f43f5e);
+}
+
+.inkbook-root input.inkbook-custom::-webkit-color-swatch-wrapper {
+  padding: 0;
+}
+
+.inkbook-root input.inkbook-custom::-webkit-color-swatch {
+  border: none;
+  opacity: 0;
+}
+
+.inkbook-root input.inkbook-custom.is-active::-webkit-color-swatch {
+  opacity: 1;
+}
+
+.inkbook-pagelabel {
+  min-width: 52px;
+  text-align: center;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted, #555);
+}
+
+.inkbook-stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--background-secondary, #e8e8ec);
+  touch-action: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+  cursor: crosshair;
+}
+
+.inkbook-page {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform-origin: 0 0;
+  box-shadow: 0 1px 5px rgba(0, 0, 0, 0.2);
+  will-change: transform;
+}
+
+.inkbook-page canvas {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  pointer-events: none;
+}
+
+.inkbook-selbar {
+  position: absolute;
+  display: none;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 10px;
+  background: var(--background-primary, #fff);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
+  z-index: 5;
+  cursor: default;
+}
+
+.inkbook-hint {
+  position: absolute;
+  right: 14px;
+  top: 50%;
+  transform: translateY(-50%);
+  padding: 8px 14px;
+  border-radius: 18px;
+  background: var(--interactive-accent, #6d5ae6);
+  color: var(--text-on-accent, #fff);
+  font-size: 13px;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 4;
+}
