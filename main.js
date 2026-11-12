@@ -400,6 +400,9 @@ class Editor {
     this.undoStack = []; this.redoStack = [];
     this.liveQueued = false; this.resTimer = 0;
     this.rect = { left: 0, top: 0 };
+    this.origin = { x: 0, y: 0, k: 1 };  // where the page really is on screen, measured at pen-down
+    this.gestureQueued = false;
+    this.penUpAt = 0;
 
     this.root = el('div', 'inkbook-root', parent);
     this.root.tabIndex = -1;
@@ -420,8 +423,16 @@ class Editor {
     st.addEventListener('pointercancel', (e) => this.onUp(e));
     st.addEventListener('wheel', (e) => this.onWheel(e), { passive: false });
     st.addEventListener('contextmenu', (e) => e.preventDefault());
-    // Keep Obsidian's sidebar swipes and iOS scrolling away from the page.
-    st.addEventListener('touchstart', (e) => e.stopPropagation(), { passive: true });
+    // Keep Obsidian's sidebar swipes and iOS scrolling away from the page. Cancelling touchstart also
+    // stops iPadOS Scribble / text selection from grabbing the Pencil, which otherwise delays or
+    // swallows its pointer events until the pencil lifts.
+    st.addEventListener('touchstart', (e) => {
+      e.stopPropagation();
+      if (!this.selBar.contains(e.target)) e.preventDefault();
+    }, { passive: false });
+    // overflow:hidden boxes can still be scrolled by the browser; any scroll would shift the page
+    // away from where the pen maths thinks it is.
+    st.addEventListener('scroll', () => { st.scrollLeft = 0; st.scrollTop = 0; });
     st.addEventListener('touchmove', (e) => { e.stopPropagation(); e.preventDefault(); }, { passive: false });
     this.root.addEventListener('keydown', (e) => this.onKey(e));
     this.ro = new ResizeObserver(() => this.layout());
@@ -695,26 +706,39 @@ class Editor {
     }
   }
 
-  /* While writing, only the newly finished pieces of the stroke are painted — no full redraws. */
+  /* While writing, the stroke is redrawn each frame right up to the pencil tip (the stabilised
+     curve plus a final piece to the raw pen position), clearing only the area it covers. */
   paintLiveStroke(a) {
-    const s = a.s;
-    if (a.snapped || s.t === 'highlighter') {
-      this.clearLive();
-      drawStroke(this.ctxOf(this.live), a.snapped ? Object.assign({}, s, { p: a.snapped }) : s);
-      return;
+    const s = a.s, ctx = this.ctxOf(this.live);
+    const p = a.snapped || (a.rx === s.p[s.p.length - 3] && a.ry === s.p[s.p.length - 2]
+      ? s.p : s.p.concat([r2(a.rx), r2(a.ry), r2(a.sp)]));
+    const tmp = { t: s.t, c: s.c, w: s.w, p };
+    if (a.box) {
+      const b = a.box;
+      ctx.clearRect(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0);
     }
-    const n = s.p.length / 3;
-    if (n < 2) return;
-    const ctx = this.ctxOf(this.live);
-    ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.strokeStyle = s.c;
-    for (let j = a.drawn; j <= n - 2; j++) drawPiece(ctx, s, j);
-    a.drawn = n - 1;
+    const b = ptsBox(p, 3), m = s.w * 2 + 2 / this.res;
+    a.box = { x0: b.x0 - m, y0: b.y0 - m, x1: b.x1 + m, y1: b.y1 + m };
+    ctx.save();
+    drawStroke(ctx, tmp);
+    ctx.restore();
   }
 
   /* ---------------- input ---------------- */
 
+  /* Pen coordinates come from where the page is actually drawn (its on-screen box), not from the
+     model's tx/ty, so any outside offset — scrolled containers, sidebars, a running animation,
+     Obsidian's own zoom — can't make ink land away from the pencil tip. */
+  measureOrigin() {
+    if (this.pageEl.getAnimations) for (const an of this.pageEl.getAnimations()) an.finish();
+    const r = this.pageEl.getBoundingClientRect();
+    const k = r.width > 0 ? r.width / this.nb.w : this.scale;
+    this.origin = { x: r.left, y: r.top, k };
+  }
+
   toPage(e) {
-    return [(e.clientX - this.rect.left - this.tx) / this.scale, (e.clientY - this.rect.top - this.ty) / this.scale];
+    const o = this.origin;
+    return [(e.clientX - o.x) / o.k, (e.clientY - o.y) / o.k];
   }
 
   pressure(e) {
@@ -730,17 +754,28 @@ class Editor {
 
     if (e.pointerType === 'touch') {
       if (this.act && !this.act.touch) return;              // pencil is down: this is a resting palm
+      // A hand landing right after the pencil lifts is a palm, not a scroll.
+      if (!this.touches.size && performance.now() - this.penUpAt < 350) return;
       this.touches.set(e.pointerId, { x: e.clientX - this.rect.left, y: e.clientY - this.rect.top });
-      if (this.prefs.fingerDraw && this.touches.size === 1 && !this.act) { this.beginAct(e); return; }
+      if (this.prefs.fingerDraw && this.touches.size === 1 && !this.act) { this.measureOrigin(); this.beginAct(e); return; }
       if (this.act) this.cancelAct();                       // second finger: stop drawing, start pinch
-      this.beginGesture();
+      this.beginGesture(this.gesture && this.gesture.pinched);
       return;
     }
     if (e.pointerType === 'mouse' && e.button !== 0) return;
     if (this.act) return;
     e.preventDefault();
-    if (this.gesture) this.endGesture(true);                // pencil wins over any finger gesture
+    if (this.gesture) {                                     // pencil wins over any finger gesture
+      const g = this.gesture;
+      this.endGesture(true);
+      // A palm that touched down just before the pencil may have dragged the page; put it back.
+      if (!g.pinched && performance.now() - g.t0 < 1000) {
+        this.scale = g.scale; this.tx = g.tx; this.ty = g.ty;
+        this.clampPan(); this.applyTransform();
+      }
+    }
     this.touches.clear();
+    this.measureOrigin();
     this.beginAct(e);
   }
 
@@ -750,15 +785,26 @@ class Editor {
     const t = this.touches.get(e.pointerId);
     if (t && this.gesture) {
       t.x = e.clientX - this.rect.left; t.y = e.clientY - this.rect.top;
-      this.moveGesture();
+      // Each finger reports separately; apply them together once per frame so a pinch doesn't jitter.
+      if (!this.gestureQueued) {
+        this.gestureQueued = true;
+        requestAnimationFrame(() => { this.gestureQueued = false; if (this.gesture) this.moveGesture(); });
+      }
     }
   }
 
   onUp(e) {
     const a = this.act;
-    if (a && a.id === e.pointerId) { this.touches.delete(e.pointerId); this.endAct(); return; }
+    if (a && a.id === e.pointerId) {
+      this.touches.delete(e.pointerId);
+      if (!a.touch) this.penUpAt = performance.now();
+      this.endAct();
+      return;
+    }
     if (this.touches.delete(e.pointerId) && this.gesture) {
-      if (this.touches.size) this.beginGesture(); else this.endGesture(false);
+      // After a pinch the remaining finger only pans; it never turns the page.
+      if (this.touches.size) this.beginGesture(this.gesture.pinched || this.gesture.mode === 'pinch');
+      else this.endGesture(false);
     }
   }
 
@@ -795,12 +841,16 @@ class Editor {
     return { x: x / n, y: y / n, d: n >= 2 ? Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y) : 0 };
   }
 
-  beginGesture() {
-    const c = this.centroid();
+  beginGesture(pinched) {
+    const c = this.centroid(), old = this.gesture;
+    if (old && old.mode === 'swipe' && old.swipe) this.applyTransform();   // drop a half-done swipe
+    const two = this.touches.size >= 2;
     this.gesture = {
       n: this.touches.size, cx: c.x, cy: c.y, d: c.d,
       scale: this.scale, tx: this.tx, ty: this.ty,
-      mode: this.touches.size >= 2 ? 'pinch' : 'undecided', swipe: 0,
+      mode: two ? 'pinch' : pinched ? 'pan' : 'undecided', swipe: 0,
+      pinched: !!pinched || two,
+      t0: old ? old.t0 : performance.now(),
     };
   }
 
@@ -880,7 +930,7 @@ class Editor {
         sx: x, sy: y, sp: pr,           // stabilised position
         rx: x, ry: y,                   // raw position
         ax: x, ay: y,                   // anchor for hold-to-snap
-        drawn: 0, snapped: null, timer: 0,
+        box: null, snapped: null, timer: 0,
       };
       this.armHold(this.act);
     }

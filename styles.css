@@ -124,6 +124,8 @@
   flex: 1;
   min-height: 0;
   overflow: hidden;
+  overflow: clip;
+  overscroll-behavior: none;
   background: var(--background-secondary, #e8e8ec);
   touch-action: none;
   -webkit-touch-callout: none;
