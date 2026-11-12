@@ -9,6 +9,7 @@
 }
 
 .inkbook-root {
+  position: relative;
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -133,23 +134,49 @@
   cursor: crosshair;
 }
 
+.inkbook-view {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
 .inkbook-page {
   position: absolute;
   left: 0;
   top: 0;
   transform-origin: 0 0;
+  background: #fff;
   box-shadow: 0 1px 5px rgba(0, 0, 0, 0.2);
-  will-change: transform;
 }
 
-.inkbook-page canvas {
+.inkbook-layer {
   position: absolute;
-  left: 0;
-  top: 0;
-  width: 100%;
-  height: 100%;
   display: block;
   pointer-events: none;
+}
+
+.inkbook-root .inkbook-swatch.is-current {
+  width: 28px;
+  height: 28px;
+  min-width: 28px;
+}
+
+.inkbook-colorpop {
+  position: absolute;
+  z-index: 20;
+  display: grid;
+  grid-template-columns: repeat(4, 28px);
+  gap: 8px;
+  padding: 10px;
+  border-radius: 12px;
+  background: var(--background-primary, #fff);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.25);
+}
+
+.inkbook-colorpop .inkbook-swatch {
+  width: 28px;
+  height: 28px;
+  margin: 0;
 }
 
 .inkbook-selbar {
