@@ -37,3 +37,11 @@ Defaults (page style, stabilisation strength, pressure, finger drawing…) are i
 
 `dev/index.html` runs the drawing engine in a normal browser with the Obsidian API stubbed out
 (serve the `inkbook` folder with `python -m http.server`). It is not needed for the plugin.
+
+## Install with BRAT (easiest on iPad)
+
+1. Install the **BRAT** community plugin and enable it.
+2. BRAT settings → **Add beta plugin** → paste this repository's URL → Add.
+3. Enable **Inkbook** under Community plugins. BRAT keeps it updated from new GitHub releases.
+
+(Each release must have `main.js`, `manifest.json` and `styles.css` attached.)
