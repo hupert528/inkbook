@@ -21,15 +21,17 @@
   // Stand-ins for the Obsidian API so main.js loads in a plain browser. Not used by the real plugin.
   var module = { exports: {} };
   function require() {
-    return { Plugin: class {}, TextFileView: class {}, Modal: class {}, PluginSettingTab: class {} };
+    return { Plugin: class {}, TextFileView: class {}, Modal: class {}, PluginSettingTab: class {}, FuzzySuggestModal: class {} };
   }
 </script>
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
 <script src="../main.js"></script>
 <script>
   const Plugin = module.exports, T = Plugin.internals;
   const KEY = 'inkbook-dev';
   const prefs = Object.assign({}, T.DEFAULT_PREFS);
   let clip = null;
+  const files = window.files = new Map();
   window.saved = [];
   const host = {
     prefs,
@@ -52,6 +54,16 @@
     },
     notice(t) { console.log('[notice]', t); },
     confirm(t) { return Promise.resolve(confirm(t)); },
+    // PDFs: kept in memory by name (the real plugin stores them in the vault).
+    async loadPdf(src) {
+      const lib = window.pdfjsLib;
+      if (!lib) throw new Error('pdf.js not loaded');
+      lib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
+      if (!files.has(src)) throw new Error('file not found: ' + src);
+      return lib.getDocument({ data: files.get(src).slice(0) }).promise;
+    },
+    async storePdf(name, buffer) { files.set(name, new Uint8Array(buffer)); return name; },
+    async pickPdf() { return files.keys().next().value || null; },
     getClipboard() { return clip; },
     setClipboard(s) { clip = s; },
     async saveFile(suffix, buffer, mime) {

@@ -205,3 +205,134 @@
   pointer-events: none;
   z-index: 4;
 }
+
+/* ---------- page overview ---------- */
+
+.inkbook-overview {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  background: var(--background-secondary, #e8e8ec);
+}
+
+.inkbook-ovhead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--background-modifier-border, #dcdce0);
+  background: var(--background-primary, #fff);
+}
+
+.inkbook-ovtitle {
+  flex: 1;
+  font-weight: 600;
+  font-size: 15px;
+}
+
+.inkbook-ovactions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.inkbook-root button.inkbook-textbtn {
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.inkbook-root button.inkbook-textbtn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.inkbook-ovgrid {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+  gap: 18px;
+  padding: 16px;
+  align-content: start;
+}
+
+.inkbook-tile {
+  position: relative;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.inkbook-thumb {
+  display: block;
+  width: 100%;
+  height: auto;
+  background: #fff;
+  border-radius: 3px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+}
+
+.inkbook-tile.is-current .inkbook-thumb {
+  box-shadow: 0 0 0 3px var(--interactive-accent, #6d5ae6);
+}
+
+.inkbook-tile.is-picked .inkbook-thumb {
+  box-shadow: 0 0 0 3px var(--interactive-accent, #6d5ae6);
+  opacity: 0.85;
+}
+
+.inkbook-tilenum {
+  margin-top: 6px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-muted, #555);
+}
+
+.inkbook-check {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2px solid #fff;
+  background: rgba(0, 0, 0, 0.25);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+}
+
+.inkbook-tile.is-picked .inkbook-check {
+  background: var(--interactive-accent, #6d5ae6);
+}
+
+.inkbook-tile.is-picked .inkbook-check::after {
+  content: '';
+  position: absolute;
+  left: 6px;
+  top: 2px;
+  width: 5px;
+  height: 10px;
+  border: solid #fff;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+
+.inkbook-addtile {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 40px;
+  color: var(--text-muted, #888);
+  border: 2px dashed var(--background-modifier-border, #c8c8cf);
+  border-radius: 4px;
+}
+
+.inkbook-pagelabel {
+  cursor: pointer;
+}
