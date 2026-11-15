@@ -57,6 +57,7 @@ function parseNotebook(text, prefs) {
   for (const p of d.pages) {
     if (!p.id) p.id = uid();
     if (!TEMPLATES[p.tpl]) p.tpl = 'squared';
+    if (p.bg && (typeof p.bg.src !== 'string' || !(p.bg.n >= 1))) delete p.bg;   // imported PDF page
     p.strokes = p.strokes.filter((s) => s && Array.isArray(s.p) && s.p.length >= 3 && s.p.length % 3 === 0);
   }
   if (!d.pages.length) d.pages.push({ id: uid(), tpl: prefs.template, strokes: [] });
@@ -140,16 +141,28 @@ function reversals(p, axis, min) {
 
 /* A scribble is a dense back-and-forth zigzag: lots of ink in a small box, several reversals. */
 function isScribble(p) {
-  if (p.length < 36) return false;
+  if (p.length < 45) return false;
   const b = ptsBox(p, 3), diag = Math.hypot(b.x1 - b.x0, b.y1 - b.y0);
-  if (diag < 6 || pathLength(p, 3) < diag * 2.8) return false;
+  if (diag < 6 || pathLength(p, 3) < diag * 3.5) return false;
   const min = Math.max(3, diag * 0.15);
-  return Math.max(reversals(p, 0, min), reversals(p, 1, min)) >= 3;
+  return Math.max(reversals(p, 0, min), reversals(p, 1, min)) >= 4;
 }
 
+/* A stroke is scribbled out only when most of it is covered by the scribble — at least 45% of
+   its points lie close to the scribble's path — so ink that is merely touched survives. */
 function scribbleHits(p, s) {
-  for (let i = 0; i < p.length; i += 3) if (strokeNear(s, p[i], p[i + 1], 1)) return true;
-  return false;
+  const b = strokeBox(s), pb = ptsBox(p, 3);
+  if (b.x1 < pb.x0 || b.x0 > pb.x1 || b.y1 < pb.y0 || b.y0 > pb.y1) return false;
+  const q = s.p, n = q.length / 3, d = Math.max(3, s.w / 2 + 2.5), dd = d * d;
+  let covered = 0;
+  for (let i = 0; i < q.length; i += 3) {
+    const x = q[i], y = q[i + 1];
+    if (x < pb.x0 - d || x > pb.x1 + d || y < pb.y0 - d || y > pb.y1 + d) continue;
+    for (let j = 3; j < p.length; j += 3) {
+      if (segDist2(x, y, p[j - 3], p[j - 2], p[j], p[j + 1]) <= dd) { covered++; break; }
+    }
+  }
+  return covered / n >= 0.45;
 }
 
 /* Returns corrected points for a straight line or circle/ellipse, or null. */
@@ -317,7 +330,7 @@ function pdfStroke(o, s) {
   if (hl) o.push('Q');
 }
 
-function pdfPage(nb, page) {
+function pdfPage(nb, page, img) {
   const o = [], paper = PAPERS[nb.paper] || PAPERS.white, g = templateGeom(nb, page);
   o.push(`1 0 0 -1 0 ${f2(nb.h)} cm`);                       // flip so y grows downward like the canvas
   o.push(`${hexRgb(paper.bg)} rg 0 0 ${f2(nb.w)} ${f2(nb.h)} re f`);
@@ -330,6 +343,10 @@ function pdfPage(nb, page) {
     o.push(`${hexRgb(paper.dot)} rg`);
     for (let i = 0; i < g.dots.length; i += 2) o.push(`${f2(g.dots[i] - 0.6)} ${f2(g.dots[i + 1] - 0.6)} 1.2 1.2 re`);
     o.push('f');
+  }
+  if (img) {                                                  // imported PDF page, drawn upright
+    const f = img.fit;
+    o.push(`q ${f2(f.w)} 0 0 ${f2(-f.h)} ${f2(f.x)} ${f2(f.y + f.h)} cm /Im0 Do Q`);
   }
   o.push('1 J 1 j');
   for (const s of page.strokes) pdfStroke(o, s);
@@ -344,28 +361,37 @@ async function deflate(bytes) {
   } catch (e) { return null; }
 }
 
-async function buildPdf(nb) {
+/* pages: indices to include (default all). images: Map index -> { bytes (JPEG), w, h, fit } for
+   pages that have an imported PDF page behind the ink. */
+async function buildPdf(nb, pages, images) {
   const enc = new TextEncoder(), chunks = [], offsets = [];
   let size = 0;
   const put = (d) => { const b = typeof d === 'string' ? enc.encode(d) : d; chunks.push(b); size += b.length; };
   const obj = (id, body) => { offsets[id] = size; put(`${id} 0 obj\n${body}\nendobj\n`); };
-  const n = nb.pages.length;
+  const list = pages || nb.pages.map((_, i) => i), n = list.length;
+  images = images || new Map();
   put('%PDF-1.4\n'); put(new Uint8Array([37, 226, 227, 207, 211, 10]));
   obj(1, '<< /Type /Catalog /Pages 2 0 R >>');
-  obj(2, `<< /Type /Pages /Count ${n} /Kids [${nb.pages.map((_, i) => `${3 + 2 * i} 0 R`).join(' ')}] >>`);
+  obj(2, `<< /Type /Pages /Count ${n} /Kids [${list.map((_, i) => `${3 + 3 * i} 0 R`).join(' ')}] >>`);
   for (let i = 0; i < n; i++) {
-    const pid = 3 + 2 * i, cid = pid + 1;
-    const raw = enc.encode(pdfPage(nb, nb.pages[i]));
+    const pid = 3 + 3 * i, cid = pid + 1, iid = pid + 2, img = images.get(list[i]);
+    const raw = enc.encode(pdfPage(nb, nb.pages[list[i]], img));
     const packed = await deflate(raw);
     const data = packed || raw;
     obj(pid, `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${f2(nb.w)} ${f2(nb.h)}] ` +
-      `/Resources << /ExtGState << /GH << /Type /ExtGState /CA ${HL_ALPHA} /ca ${HL_ALPHA} /BM /Multiply >> >> >> ` +
-      `/Contents ${cid} 0 R >>`);
+      `/Resources << /ExtGState << /GH << /Type /ExtGState /CA ${HL_ALPHA} /ca ${HL_ALPHA} /BM /Multiply >> >>` +
+      `${img ? ` /XObject << /Im0 ${iid} 0 R >>` : ''} >> /Contents ${cid} 0 R >>`);
     offsets[cid] = size;
     put(`${cid} 0 obj\n<< /Length ${data.length}${packed ? ' /Filter /FlateDecode' : ''} >>\nstream\n`);
     put(data); put('\nendstream\nendobj\n');
+    if (img) {
+      offsets[iid] = size;
+      put(`${iid} 0 obj\n<< /Type /XObject /Subtype /Image /Width ${img.w} /Height ${img.h} /ColorSpace /DeviceRGB ` +
+        `/BitsPerComponent 8 /Filter /DCTDecode /Length ${img.bytes.length} >>\nstream\n`);
+      put(img.bytes); put('\nendstream\nendobj\n');
+    } else obj(iid, 'null');
   }
-  const count = 2 + 2 * n, xref = size;
+  const count = 2 + 3 * n, xref = size;
   put(`xref\n0 ${count + 1}\n0000000000 65535 f \n`);
   for (let id = 1; id <= count; id++) put(String(offsets[id]).padStart(10, '0') + ' 00000 n \n');
   put(`trailer\n<< /Size ${count + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`);
@@ -411,6 +437,12 @@ class Editor {
     this.origin = { x: 0, y: 0, k: 1 };  // where the page really is on screen, measured at pen-down
     this.gestureQueued = false;
     this.penUpAt = 0;
+    this.pdfDocs = new Map();         // vault path -> Promise<pdf.js document>
+    this.bgLow = new Map();           // "path#page" -> low-res render (small LRU)
+    this.bgThumb = new Map();         // "path#page" -> thumbnail render
+    this.bgHi = null; this.bgPending = null; this.bgToken = 0; this.bgTimer = 0;
+    this.ov = null;                   // page overview, when open
+    this.bgWaiters = new Map();
 
     this.root = el('div', 'inkbook-root', parent);
     this.root.tabIndex = -1;
@@ -447,6 +479,7 @@ class Editor {
     st.addEventListener('scroll', () => { st.scrollLeft = 0; st.scrollTop = 0; });
     st.addEventListener('touchmove', (e) => { e.stopPropagation(); e.preventDefault(); }, { passive: false });
     this.root.addEventListener('keydown', (e) => this.onKey(e));
+    this.root.addEventListener('paste', (e) => this.onPaste(e));
     this.ro = new ResizeObserver(() => this.layout());
     this.ro.observe(st);
   }
@@ -454,7 +487,10 @@ class Editor {
   destroy() {
     this.ro.disconnect();
     this.closeColors();
-    clearTimeout(this.resTimer);
+    this.closeOverview();
+    clearTimeout(this.resTimer); clearTimeout(this.bgTimer);
+    if (this.bgTask) try { this.bgTask.cancel(); } catch (e) { /* already finished */ }
+    for (const d of this.pdfDocs.values()) d.then((doc) => doc.destroy && doc.destroy(), () => {});
     if (this.act && this.act.timer) clearTimeout(this.act.timer);
     this.root.remove();
   }
@@ -498,8 +534,10 @@ class Editor {
     const g3 = el('div', 'inkbook-group', t);
     this.prevBtn = this.btn(g3, 'chevron-left', 'Previous page', () => this.goTo(this.pageIndex - 1, -1));
     this.pageLabel = el('div', 'inkbook-pagelabel', g3);
+    this.pageLabel.addEventListener('click', () => this.openOverview());
     this.nextBtn = this.btn(g3, 'chevron-right', 'Next page', () => this.goTo(this.pageIndex + 1, 1));
     this.btn(g3, 'plus', 'Add page', () => this.addPage());
+    this.btn(g3, 'layout-dashboard|layout-grid', 'All pages', () => this.openOverview());
     const g4 = el('div', 'inkbook-group', t);
     this.btn(g4, 'layout-grid|grid', 'Page style', (e) => this.pageMenu(e));
     this.btn(g4, 'more-horizontal|more-vertical', 'More', (e) => this.moreMenu(e));
@@ -607,7 +645,11 @@ class Editor {
     const toggle = (key, title) => ({ title, checked: !!p[key], click: () => { p[key] = !p[key]; this.host.savePrefs(); } });
     this.host.menu([
       { title: 'Export notebook as PDF', icon: 'file-down', click: () => this.exportPdf() },
+      { title: 'Export some pages as PDF…', icon: 'files', click: () => this.openOverview(true) },
       { title: 'Export this page as PNG', icon: 'image', click: () => this.exportPng() },
+      '-',
+      { title: 'Import PDF from vault…', icon: 'file-input', click: () => this.pickVaultPdf() },
+      { title: 'Import PDF from device…', icon: 'upload', click: () => this.pickDevicePdf() },
       '-',
       { title: 'Zoom to fit', icon: 'maximize', click: () => { this.fit(); this.applyTransform(); this.render(); } },
       { title: 'Clear page', icon: 'eraser', click: () => this.clearPage() },
@@ -728,6 +770,7 @@ class Editor {
     ctx.save();
     ctx.beginPath(); ctx.rect(0, 0, nb.w, nb.h); ctx.clip();
     drawTemplate(ctx, nb, page);
+    if (page.bg) this.drawBg(ctx, page.bg);
     const v = this.rv, W = this.main.width / v.k, H = this.main.height / v.k;   // skip off-screen ink
     const x0 = (-v.mx - v.tx) / v.s, y0 = (-v.my - v.ty) / v.s, x1 = x0 + W / v.s, y1 = y0 + H / v.s;
     for (const s of page.strokes) {
@@ -906,12 +949,25 @@ class Editor {
     let done = true;
     if (mod && k === 'z') e.shiftKey ? this.redo() : this.undo();
     else if (mod && k === 'y') this.redo();
-    else if (mod && k === 'v') this.paste();
+    else if (mod && k === 'v') {
+      // Let the browser's paste event come through (it may carry a PDF); fall back to ink paste.
+      this.pasteSeen = false;
+      setTimeout(() => { if (!this.pasteSeen) this.paste(); }, 80);
+      return;
+    }
     else if (this.sel.size && mod && k === 'c') this.copySel();
     else if (this.sel.size && mod && k === 'x') { this.copySel(); this.deleteSel(); }
     else if (this.sel.size && (k === 'delete' || k === 'backspace')) this.deleteSel();
     else done = false;
     if (done) { e.preventDefault(); e.stopPropagation(); }
+  }
+
+  onPaste(e) {
+    this.pasteSeen = true;
+    const files = e.clipboardData ? Array.from(e.clipboardData.files || []) : [];
+    const pdf = files.find((f) => f.type === 'application/pdf' || /\.pdf$/i.test(f.name || ''));
+    e.preventDefault();
+    if (pdf) this.importPdfFile(pdf); else this.paste();
   }
 
   /* ---------------- finger gestures: pan, pinch-zoom, page swipe ---------------- */
@@ -1150,7 +1206,8 @@ class Editor {
   }
 
   eraseAlong(x0, y0, x1, y1) {
-    const a = this.act, page = this.page, r = this.prefs.eraserSize / 2;
+    // Only the inner part of the eraser circle counts, so it has to really pass over the ink.
+    const a = this.act, page = this.page, r = this.prefs.eraserSize * 0.3;
     const steps = Math.max(1, Math.ceil(Math.hypot(x1 - x0, y1 - y0) / Math.max(r, 1)));
     let hit = null;
     for (const s of page.strokes) {
@@ -1364,27 +1421,334 @@ class Editor {
     this.renderMain(); this.clearLive(); this.changed();
   }
 
+  /* ---------------- imported PDF pages ---------------- */
+
+  bgKey(bg) { return bg.src + '#' + bg.n; }
+
+  pdfDoc(src) {
+    let d = this.pdfDocs.get(src);
+    if (!d) {
+      d = Promise.resolve().then(() => this.host.loadPdf(src));
+      this.pdfDocs.set(src, d);
+      d.catch(() => this.pdfDocs.delete(src));
+    }
+    return d;
+  }
+
+  /* A PDF page is scaled to fit the notebook page and centred. */
+  bgFit(vw, vh) {
+    const nb = this.nb, s = Math.min(nb.w / vw, nb.h / vh), w = vw * s, h = vh * s;
+    return { x: (nb.w - w) / 2, y: (nb.h - h) / 2, w, h, s };
+  }
+
+  /* Renders a whole PDF page at `ppu` pixels per page unit, on white. */
+  async bgCanvas(bg, ppu) {
+    const doc = await this.pdfDoc(bg.src), pg = await doc.getPage(bg.n);
+    const vp1 = pg.getViewport({ scale: 1 }), fit = this.bgFit(vp1.width, vp1.height);
+    const vp = pg.getViewport({ scale: fit.s * ppu });
+    const c = document.createElement('canvas');
+    c.width = Math.max(1, Math.ceil(vp.width)); c.height = Math.max(1, Math.ceil(vp.height));
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+    await pg.render({ canvasContext: ctx, viewport: vp }).promise;
+    return { canvas: c, fit };
+  }
+
+  /* Cached render. Returns the render, null while loading (onReady runs once it arrives), or
+     {error} if the PDF could not be opened. Keeps at most `limit` renders. */
+  bgCached(cache, bg, ppu, limit, onReady) {
+    const key = this.bgKey(bg), wkey = key + '@' + ppu;
+    if (cache.has(key)) {
+      const v = cache.get(key);
+      if (v && v.canvas) { cache.delete(key); cache.set(key, v); }   // mark recently used
+      else if (v === null && onReady) this.bgWaiters.set(wkey, onReady);
+      return v;
+    }
+    cache.set(key, null);
+    if (onReady) this.bgWaiters.set(wkey, onReady);
+    this.bgCanvas(bg, ppu).then((r) => {
+      cache.set(key, r);
+      while (cache.size > limit) {
+        const [k, v] = cache.entries().next().value;
+        if (v && v.canvas) v.canvas.width = 0;                       // free iOS canvas memory now
+        cache.delete(k);
+      }
+    }, (e) => {
+      console.error(e);
+      cache.set(key, { error: e });
+      if (!this.bgWarned) { this.bgWarned = true; this.host.notice('Could not open PDF ' + bg.src + ' (' + e.message + ')'); }
+    }).then(() => {
+      const w = this.bgWaiters.get(wkey);
+      if (w) { this.bgWaiters.delete(wkey); w(); }
+    });
+    return null;
+  }
+
+  drawBg(ctx, bg) {
+    const hi = this.bgHi;
+    if (hi && hi.key === this.bgHiKey(bg)) {
+      ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.drawImage(hi.canvas, 0, 0); ctx.restore();
+      return;
+    }
+    const low = this.bgCached(this.bgLow, bg, 1.5, 6, () => { if (this.page.bg === bg) this.renderMain(); });
+    if (low && low.canvas) { const f = low.fit; ctx.drawImage(low.canvas, f.x, f.y, f.w, f.h); }
+    if (!low || low.canvas) this.renderBgHi(bg);
+  }
+
+  bgHiKey(bg) {
+    const v = this.rv;
+    return this.bgKey(bg) + '|' + [v.tx, v.ty, v.s, v.k, v.mx, v.my, this.main.width, this.main.height].join(',');
+  }
+
+  /* Renders exactly the visible part of the PDF page at screen resolution, so it stays as sharp as
+     the ink at any zoom. Runs in the background; the low-res copy shows meanwhile. */
+  renderBgHi(bg) {
+    const key = this.bgHiKey(bg);
+    if (this.bgPending === key) return;
+    this.bgPending = key;
+    const token = ++this.bgToken, v = this.rv, W = this.main.width, H = this.main.height;
+    if (this.bgTask) { try { this.bgTask.cancel(); } catch (e) { /* already finished */ } this.bgTask = null; }
+    clearTimeout(this.bgTimer);
+    this.bgTimer = setTimeout(async () => {
+      const c = document.createElement('canvas');
+      try {
+        const doc = await this.pdfDoc(bg.src), pg = await doc.getPage(bg.n);
+        if (token !== this.bgToken) return;
+        const vp1 = pg.getViewport({ scale: 1 }), fit = this.bgFit(vp1.width, vp1.height);
+        const S = v.k * v.s * fit.s;
+        const ox = v.k * (v.mx + v.tx + v.s * fit.x), oy = v.k * (v.my + v.ty + v.s * fit.y);
+        const vp = pg.getViewport({ scale: S, offsetX: ox, offsetY: oy });
+        c.width = W; c.height = H;
+        const ctx = c.getContext('2d');
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(ox, oy, vp1.width * S, vp1.height * S);
+        this.bgTask = pg.render({ canvasContext: ctx, viewport: vp });
+        await this.bgTask.promise;
+        if (token !== this.bgToken) { c.width = 0; return; }
+        if (this.bgHi) this.bgHi.canvas.width = 0;
+        this.bgHi = { key, canvas: c };
+        this.bgPending = null;
+        if (this.page.bg === bg && this.rv === v) this.renderMain();
+      } catch (e) {
+        c.width = 0;
+        if (token === this.bgToken) this.bgPending = null;
+      }
+    }, 50);
+  }
+
+  async importPdf(src) {
+    try {
+      const doc = await this.pdfDoc(src), n = doc.numPages;
+      if (!n) throw new Error('the PDF has no pages');
+      const pages = this.nb.pages, cur = this.page;
+      const fresh = pages.length === 1 && !cur.strokes.length && !cur.bg;   // brand-new notebook: replace its blank page
+      const add = [];
+      for (let i = 1; i <= n; i++) add.push({ id: uid(), tpl: 'blank', strokes: [], bg: { src, n: i } });
+      const at = fresh ? 0 : this.pageIndex + 1;
+      pages.splice(at, fresh ? 1 : 0, ...add);
+      this.closeOverview();
+      this.goTo(at, 1);
+      this.changed();
+      this.host.notice(`Imported ${n} page${n === 1 ? '' : 's'} from ${src.split('/').pop()}`);
+    } catch (e) {
+      console.error(e);
+      this.host.notice('PDF import failed: ' + e.message);
+    }
+  }
+
+  async importPdfFile(file) {
+    try {
+      const src = await this.host.storePdf(file.name || 'Pasted.pdf', await file.arrayBuffer());
+      await this.importPdf(src);
+    } catch (e) { console.error(e); this.host.notice('PDF import failed: ' + e.message); }
+  }
+
+  pickDevicePdf() {
+    const inp = document.createElement('input');
+    inp.type = 'file'; inp.accept = 'application/pdf,.pdf';
+    inp.style.display = 'none';
+    document.body.appendChild(inp);
+    inp.addEventListener('change', () => { if (inp.files && inp.files[0]) this.importPdfFile(inp.files[0]); inp.remove(); });
+    inp.click();
+  }
+
+  async pickVaultPdf() {
+    const src = await this.host.pickPdf();
+    if (src) this.importPdf(src);
+  }
+
+  /* ---------------- page overview ---------------- */
+
+  openOverview(selecting) {
+    this.closeOverview();
+    this.clearSelection();
+    const root = el('div', 'inkbook-overview', this.root);
+    const head = el('div', 'inkbook-ovhead', root);
+    this.ov = {
+      el: root, selecting: !!selecting,
+      picked: new Set(selecting ? this.nb.pages.map((_, i) => i) : []),
+      title: el('div', 'inkbook-ovtitle', head),
+      actions: el('div', 'inkbook-ovactions', head),
+      grid: el('div', 'inkbook-ovgrid', root),
+      io: null,
+    };
+    this.buildOverview();
+  }
+
+  closeOverview() {
+    if (!this.ov) return;
+    if (this.ov.io) this.ov.io.disconnect();
+    this.ov.el.remove();
+    this.ov = null;
+  }
+
+  ovButton(text, fn, cls) {
+    const b = el('button', 'inkbook-textbtn' + (cls ? ' ' + cls : ''), this.ov.actions);
+    b.textContent = text;
+    b.addEventListener('click', (e) => { e.preventDefault(); fn(); });
+    return b;
+  }
+
+  refreshOverviewHead() {
+    const ov = this.ov, n = this.nb.pages.length, k = ov.picked.size;
+    ov.actions.textContent = '';
+    if (ov.selecting) {
+      ov.title.textContent = k ? `${k} of ${n} selected` : 'Tap pages to select';
+      this.ovButton(k === n ? 'Select none' : 'Select all', () => {
+        ov.picked = new Set(k === n ? [] : this.nb.pages.map((_, i) => i));
+        this.buildOverview();
+      });
+      const ex = this.ovButton('Export PDF', () => this.exportPdf([...ov.picked].sort((a, b) => a - b)), 'mod-cta');
+      const del = this.ovButton('Delete', () => this.deletePages([...ov.picked]), 'mod-warning');
+      ex.disabled = del.disabled = !k;
+      this.ovButton('Cancel', () => { ov.selecting = false; ov.picked.clear(); this.buildOverview(); });
+    } else {
+      ov.title.textContent = `${n} page${n === 1 ? '' : 's'}`;
+      this.ovButton('Select', () => { ov.selecting = true; this.buildOverview(); });
+      this.ovButton('Done', () => this.closeOverview(), 'mod-cta');
+    }
+  }
+
+  buildOverview() {
+    const ov = this.ov, nb = this.nb;
+    this.refreshOverviewHead();
+    if (ov.io) ov.io.disconnect();
+    ov.grid.textContent = '';
+    // Thumbnails are drawn only when scrolled into view, so long notebooks open instantly.
+    ov.io = typeof IntersectionObserver !== 'undefined'
+      ? new IntersectionObserver((list) => {
+        for (const en of list) if (en.isIntersecting) { ov.io.unobserve(en.target); en.target._draw(); }
+      }, { root: ov.grid, rootMargin: '300px' })
+      : null;
+    nb.pages.forEach((page, i) => {
+      const tile = el('div', 'inkbook-tile' + (i === this.pageIndex ? ' is-current' : '') + (ov.picked.has(i) ? ' is-picked' : ''), ov.grid);
+      const c = el('canvas', 'inkbook-thumb', tile);
+      c.style.aspectRatio = `${nb.w} / ${nb.h}`;
+      el('div', 'inkbook-tilenum', tile).textContent = String(i + 1);
+      if (ov.selecting) el('div', 'inkbook-check', tile);
+      tile._draw = () => this.drawThumb(c, page);
+      if (ov.io) ov.io.observe(tile); else tile._draw();
+      tile.addEventListener('click', () => {
+        if (ov.selecting) {
+          if (ov.picked.has(i)) ov.picked.delete(i); else ov.picked.add(i);
+          tile.classList.toggle('is-picked', ov.picked.has(i));
+          this.refreshOverviewHead();
+        } else {
+          this.closeOverview();
+          if (i !== this.pageIndex) this.goTo(i, i > this.pageIndex ? 1 : -1);
+        }
+      });
+    });
+    if (!ov.selecting) {
+      const add = el('div', 'inkbook-tile inkbook-addtile', ov.grid);
+      add.textContent = '+';
+      add.style.aspectRatio = `${nb.w} / ${nb.h}`;
+      add.setAttribute('aria-label', 'Add page at the end');
+      add.addEventListener('click', () => {
+        nb.pages.push({ id: uid(), tpl: nb.pages[nb.pages.length - 1].tpl, strokes: [] });
+        this.changed(); this.buildOverview();
+        ov.grid.scrollTop = ov.grid.scrollHeight;
+      });
+    }
+  }
+
+  drawThumb(c, page) {
+    const nb = this.nb, k = (Math.min(2, window.devicePixelRatio || 1) * 150) / nb.w;
+    c.width = Math.round(nb.w * k); c.height = Math.round(nb.h * k);
+    const ctx = c.getContext('2d');
+    ctx.setTransform(k, 0, 0, k, 0, 0);
+    drawTemplate(ctx, nb, page);
+    if (page.bg) {
+      const r = this.bgCached(this.bgThumb, page.bg, k, 400, () => { if (c.isConnected) this.drawThumb(c, page); });
+      if (r && r.canvas) ctx.drawImage(r.canvas, r.fit.x, r.fit.y, r.fit.w, r.fit.h);
+    }
+    for (const s of page.strokes) drawStroke(ctx, s);
+  }
+
+  async deletePages(list) {
+    if (!list.length) return;
+    const pages = this.nb.pages, n = list.length;
+    if (!(await this.host.confirm(`Delete ${n} page${n === 1 ? '' : 's'}? This cannot be undone.`))) return;
+    const drop = new Set(list.map((i) => pages[i])), tpl = this.page.tpl, cur = this.page;
+    this.nb.pages = pages.filter((p) => !drop.has(p));
+    if (!this.nb.pages.length) this.nb.pages.push({ id: uid(), tpl, strokes: [] });
+    const keep = this.nb.pages.indexOf(cur);
+    this.pageIndex = keep >= 0 ? keep : Math.min(this.pageIndex, this.nb.pages.length - 1);
+    this.dropSelection(); this.render(); this.clearLive(); this.changed();
+    if (this.ov) { this.ov.picked.clear(); this.ov.selecting = false; this.buildOverview(); }
+  }
+
   /* ---------------- export ---------------- */
 
-  async exportPdf() {
+  async exportPdf(list) {
+    const nb = this.nb;
+    list = list && list.length ? list : nb.pages.map((_, i) => i);
     try {
-      const bytes = await buildPdf(this.nb);
-      await this.host.saveFile('.pdf', bytes.buffer, 'application/pdf');
+      const images = new Map();
+      if (list.some((i) => nb.pages[i].bg)) this.host.notice('Exporting…');
+      for (const i of list) {
+        const bg = nb.pages[i].bg;
+        if (!bg) continue;
+        const r = await this.bgCanvas(bg, 200 / 72);                   // imported pages at 200 dpi
+        const blob = await new Promise((res) => r.canvas.toBlob(res, 'image/jpeg', 0.88));
+        images.set(i, { bytes: new Uint8Array(await blob.arrayBuffer()), w: r.canvas.width, h: r.canvas.height, fit: r.fit });
+        r.canvas.width = 0;
+      }
+      const bytes = await buildPdf(nb, list, images);
+      const all = list.length === nb.pages.length;
+      await this.host.saveFile(all ? '.pdf' : ` - pages ${pageRanges(list)}.pdf`, bytes.buffer, 'application/pdf');
     } catch (e) { console.error(e); this.host.notice('PDF export failed: ' + e.message); }
   }
 
   async exportPng() {
     try {
-      const nb = this.nb, k = 3, c = document.createElement('canvas');
+      const nb = this.nb, k = 3, c = document.createElement('canvas'), page = this.page;
       c.width = Math.round(nb.w * k); c.height = Math.round(nb.h * k);
       const ctx = c.getContext('2d');
       ctx.scale(k, k);
-      drawTemplate(ctx, nb, this.page);
-      for (const s of this.page.strokes) drawStroke(ctx, s);
+      drawTemplate(ctx, nb, page);
+      if (page.bg) {
+        const r = await this.bgCanvas(page.bg, k);
+        ctx.drawImage(r.canvas, r.fit.x, r.fit.y, r.fit.w, r.fit.h);
+        r.canvas.width = 0;
+      }
+      for (const s of page.strokes) drawStroke(ctx, s);
       const blob = await new Promise((res) => c.toBlob(res, 'image/png'));
       await this.host.saveFile(` - page ${this.pageIndex + 1}.png`, await blob.arrayBuffer(), 'image/png');
     } catch (e) { console.error(e); this.host.notice('PNG export failed: ' + e.message); }
   }
+}
+
+/* [0,1,2,4,6,7] -> "1-3, 5, 7-8" */
+function pageRanges(list) {
+  const out = [];
+  for (let i = 0; i < list.length; i++) {
+    let j = i;
+    while (j + 1 < list.length && list[j + 1] === list[j] + 1) j++;
+    out.push(j > i ? `${list[i] + 1}-${list[j] + 1}` : `${list[i] + 1}`);
+    i = j;
+  }
+  return out.join(', ');
 }
 
 /* ------------------------------------------------------------------ */
@@ -1425,6 +1789,15 @@ class NewNotebookModal extends obsidian.Modal {
     new obsidian.Setting(this.contentEl).addButton((b) => b.setButtonText('Create').setCta().onClick(submit));
   }
   onClose() { this.contentEl.empty(); }
+}
+
+class PdfPickModal extends obsidian.FuzzySuggestModal {
+  constructor(app, done) { super(app); this.done = done; this.setPlaceholder('Choose a PDF to add to this notebook'); }
+  getItems() { return this.app.vault.getFiles().filter((f) => f.extension.toLowerCase() === 'pdf'); }
+  getItemText(f) { return f.path; }
+  onChooseItem(f) { this.done(f.path); }
+  // Obsidian closes the modal before reporting the choice, so report "nothing chosen" a moment later.
+  onClose() { setTimeout(() => this.done(null), 0); }
 }
 
 class InkbookView extends obsidian.TextFileView {
@@ -1489,6 +1862,37 @@ class InkbookView extends obsidian.TextFileView {
       },
       notice: (t) => new obsidian.Notice(t),
       confirm: (t) => new Promise((res) => new ConfirmModal(app, t, res).open()),
+      // PDF pages behind the ink are rendered with the pdf.js copy that ships inside Obsidian.
+      loadPdf: async (src) => {
+        const f = app.vault.getAbstractFileByPath(src);
+        if (!(f instanceof obsidian.TFile)) throw new Error('file not found: ' + src);
+        const lib = await obsidian.loadPdfJs();
+        const data = new Uint8Array(await app.vault.readBinary(f));
+        return lib.getDocument({ data }).promise;
+      },
+      pickPdf: () => new Promise((res) => {
+        let settled = false;
+        new PdfPickModal(app, (p) => { if (!settled) { settled = true; res(p); } }).open();
+      }),
+      // PDFs from the device or the clipboard are saved into the vault (attachment folder) first.
+      storePdf: async (name, buffer) => {
+        name = (name || '').replace(/[\\/:*?"<>|#^[\]]/g, '').trim() || 'Imported.pdf';
+        if (!/\.pdf$/i.test(name)) name += '.pdf';
+        const from = view.file ? view.file.path : '';
+        let path;
+        if (app.fileManager.getAvailablePathForAttachment) {
+          path = await app.fileManager.getAvailablePathForAttachment(name, from);
+        } else {
+          const dir = view.file && view.file.parent && view.file.parent.path !== '/' ? view.file.parent.path + '/' : '';
+          const base = name.replace(/\.pdf$/i, '');
+          path = obsidian.normalizePath(dir + name);
+          for (let i = 1; app.vault.getAbstractFileByPath(path); i++) path = obsidian.normalizePath(`${dir}${base} ${i}.pdf`);
+        }
+        const folder = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+        if (folder && !app.vault.getAbstractFileByPath(folder)) await app.vault.createFolder(folder);
+        await app.vault.createBinary(path, buffer);
+        return path;
+      },
       getClipboard: () => plugin.clipboard,
       setClipboard: (s) => { plugin.clipboard = s; },
       saveFile: async (suffix, buffer, mime) => {

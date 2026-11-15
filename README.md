@@ -28,8 +28,15 @@ needed if you paste directly into `.obsidian/plugins`). With Obsidian Sync, enab
   shape pen, which always corrects.
 - **Lasso:** circle some ink, then drag it to move, or use the popup to copy / cut / duplicate /
   delete. Paste works on any page or in another notebook. Tapping a colour recolours the selection.
-- **Export** (⋯ menu): whole notebook as a vector PDF, or the current page as PNG. The file is saved
-  next to the notebook; on iPad the share sheet opens too.
+- **All pages:** tap the page number (or the grid button next to it) for a thumbnail overview. Tap a
+  page to jump to it; tap **Select** to pick pages to export as a PDF or delete.
+- **Import a PDF** (⋯ menu): from the vault or from the device (Files app on iPad). Each PDF page
+  becomes a notebook page you can write on. On desktop you can also paste a PDF file with Ctrl/Cmd+V.
+  PDFs from the device are saved into your attachments folder; the notebook links to them, so keep
+  the PDF in the vault.
+- **Export** (⋯ menu): whole notebook or chosen pages as PDF (ink stays vector; imported PDF pages
+  are embedded at 200 dpi), or the current page as PNG. The file is saved next to the notebook; on
+  iPad the share sheet opens too.
 
 Defaults (page style, stabilisation strength, pressure, finger drawing…) are in Settings → Inkbook.
 
