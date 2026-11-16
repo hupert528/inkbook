@@ -26,6 +26,7 @@ const DEFAULT_PREFS = {
   tool: 'pen',
   penColor: PEN_COLORS[0], hlColor: HL_COLORS[0],
   penSize: PEN_SIZES[1], hlSize: HL_SIZES[1], eraserSize: ERASER_SIZES[1],
+  eraserMode: 'precise',                    // 'precise' rubs out only what is under the circle; 'stroke' removes whole strokes
   fingerDraw: false, scribbleErase: true, holdSnap: true, pressure: true,
   stabilize: 0.4,
   template: 'squared', spacing: 5 * MM, paper: 'white', landscape: false,
@@ -38,7 +39,7 @@ const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 function newNotebook(prefs, opts) {
   const o = Object.assign({ template: prefs.template, landscape: prefs.landscape }, opts);
   return {
-    version: 1,
+    version: 2,
     w: o.landscape ? A4[1] : A4[0],
     h: o.landscape ? A4[0] : A4[1],
     spacing: prefs.spacing, paper: prefs.paper,
@@ -46,22 +47,121 @@ function newNotebook(prefs, opts) {
   };
 }
 
+/* ------------------------------------------------------------------ */
+/* File format                                                         */
+/* ------------------------------------------------------------------ */
+
+/* In memory a stroke is { t, c, w, p: [x, y, pressure, x, y, pressure, ...] }.
+   On disk (version 2) the points are packed into a short string: every number is an integer
+   (coordinates in 1/32 pt, pressure in 1/100), stored as the difference from the previous point
+   and written as base64 digits, 5 bits each (the same trick as JS source maps). Pen colour and
+   width live once in a shared `styles` table. This is about a fifth of the size of plain JSON
+   numbers. Version 1 files (plain JSON numbers under `pages`) are still read. */
+const Q = 32;
+const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+const B64I = new Int8Array(128).fill(-1);
+for (let i = 0; i < 64; i++) B64I[B64.charCodeAt(i)] = i;
+
+function packPoints(p) {
+  let out = '';
+  const put = (v) => {
+    let z = v < 0 ? -2 * v - 1 : 2 * v;
+    do { const d = z % 32; z = (z - d) / 32; out += B64[z ? d + 32 : d]; } while (z);
+  };
+  const uni = uniform(p);
+  put(uni ? Math.round(p[2] * 100) : -1);     // one pressure for the whole stroke, or -1: one per point
+  let px = 0, py = 0, pp = 0;
+  for (let i = 0; i < p.length; i += 3) {
+    const x = Math.round(p[i] * Q), y = Math.round(p[i + 1] * Q);
+    put(x - px); put(y - py); px = x; py = y;
+    if (!uni) { const r = Math.round(p[i + 2] * 100); put(r - pp); pp = r; }
+  }
+  return out;
+}
+
+function unpackPoints(str) {
+  if (typeof str !== 'string') return null;
+  const v = [];
+  let acc = 0, mul = 1;
+  for (let i = 0; i < str.length; i++) {
+    const d = B64I[str.charCodeAt(i)];
+    if (!(d >= 0)) return null;
+    acc += (d & 31) * mul;
+    if (d & 32) mul *= 32;
+    else { v.push(acc % 2 ? -(acc + 1) / 2 : acc / 2); acc = 0; mul = 1; }
+  }
+  const uni = v[0] >= 0, step = uni ? 2 : 3;
+  if (mul !== 1 || v.length < 1 + step || (v.length - 1) % step) return null;
+  const p = [];
+  let x = 0, y = 0, pr = uni ? v[0] : 0;
+  for (let i = 1; i < v.length; i += step) {
+    x += v[i]; y += v[i + 1];
+    if (!uni) pr += v[i + 2];
+    p.push(x / Q, y / Q, pr / 100);
+  }
+  return p;
+}
+
+const packCache = new WeakMap();              // strokes are never changed in place once on a page
+
+function serializeNotebook(nb) {
+  const styles = [], index = new Map();
+  const pg = nb.pages.map((page) => {
+    const o = { id: page.id, tpl: page.tpl };
+    if (page.bg) o.bg = page.bg;
+    o.ink = [];
+    for (const s of page.strokes) {
+      const key = s.t + '|' + s.c + '|' + s.w;
+      let i = index.get(key);
+      if (i === undefined) { i = styles.length; index.set(key, i); styles.push([s.t === 'highlighter' ? 1 : 0, s.c, s.w]); }
+      let str = packCache.get(s);
+      if (str === undefined) { str = packPoints(s.p); packCache.set(s, str); }
+      o.ink.push(i, str);
+    }
+    return o;
+  });
+  // The page list is called `pg`, not `pages`, so an older copy of the plugin on another device
+  // refuses the file (and leaves it untouched) instead of opening it as an empty notebook.
+  return JSON.stringify({ version: 2, w: nb.w, h: nb.h, spacing: nb.spacing, paper: nb.paper, styles, pg });
+}
+
 function parseNotebook(text, prefs) {
   if (!text || !text.trim()) return newNotebook(prefs);
   const d = JSON.parse(text);
-  if (!d || !Array.isArray(d.pages)) throw new Error('Not an Inkbook notebook');
-  d.w = +d.w || A4[0]; d.h = +d.h || A4[1];
-  d.spacing = +d.spacing || 5 * MM;
-  if (!PAPERS[d.paper]) d.paper = 'white';
-  d.pages = d.pages.filter((p) => p && Array.isArray(p.strokes));
-  for (const p of d.pages) {
-    if (!p.id) p.id = uid();
-    if (!TEMPLATES[p.tpl]) p.tpl = 'squared';
-    if (p.bg && (typeof p.bg.src !== 'string' || !(p.bg.n >= 1))) delete p.bg;   // imported PDF page
-    p.strokes = p.strokes.filter((s) => s && Array.isArray(s.p) && s.p.length >= 3 && s.p.length % 3 === 0);
+  if (!d || typeof d !== 'object') throw new Error('Not an Inkbook notebook');
+  if (d.version > 2) throw new Error('it was made by a newer version of Inkbook — update the plugin on this device');
+  const v2 = Array.isArray(d.pg);
+  if (!v2 && !Array.isArray(d.pages)) throw new Error('Not an Inkbook notebook');
+  const nb = {
+    version: 2, w: +d.w || A4[0], h: +d.h || A4[1],
+    spacing: +d.spacing || 5 * MM, paper: PAPERS[d.paper] ? d.paper : 'white', pages: [],
+  };
+  const styles = Array.isArray(d.styles) ? d.styles : [];
+  for (const src of v2 ? d.pg : d.pages) {
+    if (!src) continue;
+    const page = { id: src.id || uid(), tpl: TEMPLATES[src.tpl] ? src.tpl : 'squared', strokes: [] };
+    if (src.bg && typeof src.bg.src === 'string' && src.bg.n >= 1) page.bg = { src: src.bg.src, n: src.bg.n };   // imported PDF page
+    if (v2) {
+      const ink = Array.isArray(src.ink) ? src.ink : [];
+      for (let i = 0; i + 1 < ink.length; i += 2) {
+        const st = styles[ink[i]], p = unpackPoints(ink[i + 1]);
+        if (!Array.isArray(st) || !p) continue;
+        const s = { t: st[0] ? 'highlighter' : 'pen', c: String(st[1]), w: +st[2] || 1, p };
+        packCache.set(s, ink[i + 1]);
+        page.strokes.push(s);
+      }
+    } else if (Array.isArray(src.strokes)) {
+      for (const s of src.strokes) {
+        if (!s || !Array.isArray(s.p) || s.p.length < 3 || s.p.length % 3) continue;
+        const n = { t: s.t === 'highlighter' ? 'highlighter' : 'pen', c: String(s.c), w: +s.w || 1, p: s.p };
+        n.p = simplify(n);                    // older notebooks kept every pencil sample
+        page.strokes.push(n);
+      }
+    } else continue;
+    nb.pages.push(page);
   }
-  if (!d.pages.length) d.pages.push({ id: uid(), tpl: prefs.template, strokes: [] });
-  return d;
+  if (!nb.pages.length) nb.pages.push({ id: uid(), tpl: prefs.template, strokes: [] });
+  return nb;
 }
 
 /* ------------------------------------------------------------------ */
@@ -165,19 +265,97 @@ function scribbleHits(p, s) {
   return covered / n >= 0.45;
 }
 
+/* Thins out a finished stroke. Pencils report far more points than the shape needs; this keeps
+   only those that matter (Ramer–Douglas–Peucker over x, y and line width), plus the immediate
+   neighbours of every sharp turn so that corners are drawn exactly as tight as before. */
+const SIMPLIFY_EPS = 0.06, SIMPLIFY_CORNER = 0.3;
+function simplify(s) {
+  const p = s.p, n = p.length / 3;
+  if (n < 4) return p;
+  const zk = s.t === 'highlighter' ? 0 : 0.6 * s.w;   // pressure -> half line width
+  const keep = new Uint8Array(n), stack = [0, n - 1];
+  keep[0] = keep[n - 1] = 1;
+  while (stack.length) {
+    const b = stack.pop(), a = stack.pop();
+    if (b - a < 2) continue;
+    const ax = p[3 * a], ay = p[3 * a + 1], az = p[3 * a + 2] * zk;
+    const dx = p[3 * b] - ax, dy = p[3 * b + 1] - ay, dz = p[3 * b + 2] * zk - az, l2 = dx * dx + dy * dy + dz * dz;
+    let worst = 0, at = -1;
+    for (let i = a + 1; i < b; i++) {
+      const ex = p[3 * i] - ax, ey = p[3 * i + 1] - ay, ez = p[3 * i + 2] * zk - az;
+      let t = l2 ? (ex * dx + ey * dy + ez * dz) / l2 : 0;
+      t = t < 0 ? 0 : t > 1 ? 1 : t;
+      const qx = ex - t * dx, qy = ey - t * dy, qz = ez - t * dz, d = qx * qx + qy * qy + qz * qz;
+      if (d > worst) { worst = d; at = i; }
+    }
+    if (worst > SIMPLIFY_EPS * SIMPLIFY_EPS) { keep[at] = 1; stack.push(a, at, at, b); }
+  }
+  const kept = [];
+  for (let i = 0; i < n; i++) if (keep[i]) kept.push(i);
+  for (let k = 1; k < kept.length - 1; k++) {
+    const a = 3 * kept[k - 1], c = 3 * kept[k], b = 3 * kept[k + 1];
+    if (segDist2(p[c], p[c + 1], p[a], p[a + 1], p[b], p[b + 1]) > SIMPLIFY_CORNER * SIMPLIFY_CORNER) keep[kept[k] - 1] = keep[kept[k] + 1] = 1;
+  }
+  const out = [];
+  for (let i = 0; i < n; i++) if (keep[i]) out.push(p[3 * i], p[3 * i + 1], p[3 * i + 2]);
+  return out.length === p.length ? p : out;
+}
+
+/* Precise eraser: removes the parts of stroke `s` that lie under the circle (cx, cy, R) and returns
+   what is left as new strokes — or null if the circle does not touch it. The cut is made half a
+   line width outside the circle, so the rounded ends of the remaining ink just touch its edge. */
+function cutStroke(s, cx, cy, R) {
+  const b = strokeBox(s);
+  if (cx < b.x0 - R || cx > b.x1 + R || cy < b.y0 - R || cy > b.y1 + R) return null;
+  const p = s.p, r = R + s.w / 2, rr = r * r;
+  if (p.length === 3) return (p[0] - cx) * (p[0] - cx) + (p[1] - cy) * (p[1] - cy) <= rr ? [] : null;
+  const out = [];
+  let cur = [], cut = false;
+  for (let i = 3; i < p.length; i += 3) {
+    const x0 = p[i - 3], y0 = p[i - 2], p0 = p[i - 1], dx = p[i] - x0, dy = p[i + 1] - y0, dp = p[i + 2] - p0;
+    const ax = x0 - cx, ay = y0 - cy;
+    const A = dx * dx + dy * dy, B = ax * dx + ay * dy, C = ax * ax + ay * ay - rr;
+    let t0 = 1, t1 = 0;                              // the part of this segment inside the circle
+    if (A < 1e-9) { if (C <= 0) { t0 = 0; t1 = 1; } }
+    else {
+      const D = B * B - A * C;
+      if (D > 0) { const q = Math.sqrt(D); t0 = Math.max(0, (-B - q) / A); t1 = Math.min(1, (-B + q) / A); }
+    }
+    if (t0 >= t1) {                                  // untouched
+      if (!cur.length) cur.push(x0, y0, p0);
+      cur.push(p[i], p[i + 1], p[i + 2]);
+      continue;
+    }
+    cut = true;
+    if (t0 > 0) {
+      if (!cur.length) cur.push(x0, y0, p0);
+      cur.push(r2(x0 + dx * t0), r2(y0 + dy * t0), r2(p0 + dp * t0));
+    }
+    if (cur.length) { out.push(cur); cur = []; }
+    if (t1 < 1) cur.push(r2(x0 + dx * t1), r2(y0 + dy * t1), r2(p0 + dp * t1), p[i], p[i + 1], p[i + 2]);
+  }
+  if (!cut) return null;
+  if (cur.length) out.push(cur);
+  return out.filter((q) => q.length >= 6 && pathLength(q, 3) > 0.25).map((q) => Object.assign({}, s, { p: q }));
+}
+
 /* Returns corrected points for a straight line or circle/ellipse, or null. */
 function recognize(p) {
   const n = p.length / 3;
   if (n < 3) return null;
   const len = pathLength(p, 3);
   if (len < 15) return null;
+  // The corrected shape keeps the average pressure it was drawn with, so it stays the same thickness.
+  let pr = 0;
+  for (let i = 2; i < p.length; i += 3) pr += p[i];
+  pr = r2(pr / n);
   const ax = p[0], ay = p[1], bx = p[p.length - 3], by = p[p.length - 2];
   const chord = Math.hypot(bx - ax, by - ay);
   if (chord / len > 0.86) {
     let ex = bx, ey = by;
     if (Math.abs(by - ay) / chord < 0.06) ey = ay;          // snap near-horizontal
     else if (Math.abs(bx - ax) / chord < 0.06) ex = ax;     // snap near-vertical
-    return [ax, ay, 0.5, ex, ey, 0.5];
+    return [ax, ay, pr, ex, ey, pr];
   }
   if (chord / len < 0.3) {
     const b = ptsBox(p, 3);
@@ -199,7 +377,7 @@ function recognize(p) {
     const out = [], steps = 72;
     for (let i = 0; i <= steps; i++) {
       const a = (i / steps) * Math.PI * 2;
-      out.push(r2(cx + rx * Math.cos(a)), r2(cy + ry * Math.sin(a)), 0.5);
+      out.push(r2(cx + rx * Math.cos(a)), r2(cy + ry * Math.sin(a)), pr);
     }
     return out;
   }
@@ -482,10 +660,16 @@ class Editor {
     this.root.addEventListener('paste', (e) => this.onPaste(e));
     this.ro = new ResizeObserver(() => this.layout());
     this.ro.observe(st);
+    // If the app loses focus mid-stroke the pencil-up may never arrive; start clean when it returns.
+    this.onBlur = () => this.resetInput();
+    window.addEventListener('blur', this.onBlur);
+    document.addEventListener('visibilitychange', this.onBlur);
   }
 
   destroy() {
     this.ro.disconnect();
+    window.removeEventListener('blur', this.onBlur);
+    document.removeEventListener('visibilitychange', this.onBlur);
     this.closeColors();
     this.closeOverview();
     clearTimeout(this.resTimer); clearTimeout(this.bgTimer);
@@ -539,7 +723,7 @@ class Editor {
     this.btn(g3, 'plus', 'Add page', () => this.addPage());
     this.btn(g3, 'layout-dashboard|layout-grid', 'All pages', () => this.openOverview());
     const g4 = el('div', 'inkbook-group', t);
-    this.btn(g4, 'layout-grid|grid', 'Page style', (e) => this.pageMenu(e));
+    this.btn(g4, 'settings|settings-2', 'Settings: page style and pencil options', (e) => this.settingsMenu(e));
     this.btn(g4, 'more-horizontal|more-vertical', 'More', (e) => this.moreMenu(e));
     this.refreshToolbar();
   }
@@ -551,12 +735,18 @@ class Editor {
     // One swatch showing the current colour; tapping it opens a small popup with the rest.
     this.palette.textContent = '';
     this.closeColors();
-    if (tool !== 'eraser') {
+    if (tool === 'eraser') {
+      // Precise rubs out only the ink under the circle; Stroke removes every stroke it touches.
+      for (const [mode, label] of [['precise', 'Precise'], ['stroke', 'Stroke']]) {
+        const b = el('button', 'inkbook-seg' + (p.eraserMode === mode ? ' is-active' : ''), this.palette);
+        b.textContent = label;
+        b.setAttribute('aria-label', mode === 'precise' ? 'Erase only what is under the circle' : 'Erase whole strokes');
+        b.addEventListener('click', (e) => { e.preventDefault(); p.eraserMode = mode; this.host.savePrefs(); this.refreshToolbar(); });
+      }
+    } else {
       const hl = tool === 'highlighter', cur = hl ? p.hlColor : p.penColor;
-      const b = el('button', 'inkbook-swatch is-current', this.palette);
-      b.style.backgroundColor = cur;
-      b.setAttribute('aria-label', 'Colour');
-      b.addEventListener('click', (e) => { e.preventDefault(); this.colorPop ? this.closeColors() : this.openColors(b); });
+      const b = this.swatch(this.palette, cur, 'Colour', () => (this.colorPop ? this.closeColors() : this.openColors(b)));
+      b.classList.add('is-current');
     }
 
     this.sizes.textContent = '';
@@ -574,17 +764,29 @@ class Editor {
     this.refreshState();
   }
 
+  /* Swatches are plain <div>s: themes restyle <button>s (padding, minimum sizes), which squashed
+     them into ovals. */
+  swatch(parent, color, label, fn) {
+    const b = el('div', 'inkbook-swatch', parent);
+    b.style.backgroundColor = color;
+    b.setAttribute('role', 'button');
+    b.setAttribute('aria-label', label);
+    b.addEventListener('click', (e) => { e.preventDefault(); fn(); });
+    return b;
+  }
+
   openColors(anchor) {
     const p = this.prefs, hl = p.tool === 'highlighter', cur = hl ? p.hlColor : p.penColor;
     const colors = hl ? HL_COLORS : PEN_COLORS;
     const pop = this.colorPop = el('div', 'inkbook-colorpop', this.root);
     for (const c of colors) {
-      const b = el('button', 'inkbook-swatch' + (c === cur ? ' is-active' : ''), pop);
-      b.style.backgroundColor = c;
-      b.setAttribute('aria-label', 'Colour');
-      b.addEventListener('click', () => this.setColor(c));
+      const b = this.swatch(pop, c, 'Colour', () => this.setColor(c));
+      if (c === cur) b.classList.add('is-active');
     }
-    const custom = el('input', 'inkbook-swatch inkbook-custom' + (colors.includes(cur) ? '' : ' is-active'), pop);
+    // Custom colour: a round rainbow swatch with the (invisible) system colour picker on top of it.
+    const wrap = el('div', 'inkbook-swatch inkbook-custom', pop);
+    if (!colors.includes(cur)) { wrap.classList.add('is-active'); wrap.style.background = cur; }
+    const custom = el('input', '', wrap);
     custom.type = 'color'; custom.value = cur;
     custom.setAttribute('aria-label', 'Custom colour');
     custom.addEventListener('change', () => this.setColor(custom.value));
@@ -628,21 +830,24 @@ class Editor {
     this.refreshToolbar();
   }
 
-  pageMenu(evt) {
-    const nb = this.nb, page = this.page, items = [];
-    for (const k in TEMPLATES) items.push({ title: TEMPLATES[k], checked: page.tpl === k, click: () => { page.tpl = k; this.renderMain(); this.changed(); } });
-    items.push({ title: 'Use this style on all pages', click: () => { for (const p of nb.pages) p.tpl = page.tpl; this.changed(); } });
+  /* Gear button: everything that is a setting — how the page looks and how the pencil behaves. */
+  settingsMenu(evt) {
+    const nb = this.nb, page = this.page, p = this.prefs, items = [];
+    const toggle = (key, title) => ({ title, checked: !!p[key], click: () => { p[key] = !p[key]; this.host.savePrefs(); } });
+    for (const k in TEMPLATES) items.push({ title: TEMPLATES[k] + ' page', checked: page.tpl === k, click: () => { page.tpl = k; this.renderMain(); this.changed(); } });
+    items.push({ title: 'Use this style on all pages', click: () => { for (const q of nb.pages) q.tpl = page.tpl; this.changed(); } });
     items.push('-');
-    for (const [v, title] of SPACINGS) items.push({ title, checked: Math.abs(nb.spacing - v) < 0.1, click: () => { nb.spacing = v; this.renderMain(); this.changed(); } });
+    for (const [v, title] of SPACINGS) items.push({ title: 'Grid: ' + title.toLowerCase(), checked: Math.abs(nb.spacing - v) < 0.1, click: () => { nb.spacing = v; this.renderMain(); this.changed(); } });
     items.push('-');
     items.push({ title: 'White paper', checked: nb.paper === 'white', click: () => { nb.paper = 'white'; this.renderMain(); this.changed(); } });
     items.push({ title: 'Cream paper', checked: nb.paper === 'cream', click: () => { nb.paper = 'cream'; this.renderMain(); this.changed(); } });
+    items.push('-');
+    items.push(toggle('fingerDraw', 'Draw with finger'), toggle('scribbleErase', 'Scribble to erase'), toggle('holdSnap', 'Hold to straighten lines and circles'));
     this.host.menu(items, evt);
   }
 
+  /* ⋯ button: things you do — export, import, page actions. */
   moreMenu(evt) {
-    const p = this.prefs;
-    const toggle = (key, title) => ({ title, checked: !!p[key], click: () => { p[key] = !p[key]; this.host.savePrefs(); } });
     this.host.menu([
       { title: 'Export notebook as PDF', icon: 'file-down', click: () => this.exportPdf() },
       { title: 'Export some pages as PDF…', icon: 'files', click: () => this.openOverview(true) },
@@ -654,10 +859,6 @@ class Editor {
       { title: 'Zoom to fit', icon: 'maximize', click: () => { this.fit(); this.applyTransform(); this.render(); } },
       { title: 'Clear page', icon: 'eraser', click: () => this.clearPage() },
       { title: 'Delete page', icon: 'trash-2', click: () => this.deletePage() },
-      '-',
-      toggle('fingerDraw', 'Draw with finger'),
-      toggle('scribbleErase', 'Scribble to erase'),
-      toggle('holdSnap', 'Hold to straighten lines and circles'),
     ], evt);
   }
 
@@ -878,9 +1079,16 @@ class Editor {
     try { this.stage.setPointerCapture(e.pointerId); } catch (err) { /* synthetic pointer */ }
 
     if (e.pointerType === 'touch') {
+      // The first finger of a new touch means every finger we still remember has really gone
+      // (iOS sometimes never reports a palm lifting); forget them so they can't act as a phantom
+      // second finger.
+      if (e.isPrimary && this.touches.size) {
+        if (this.act && this.act.touch) this.endAct();
+        this.touches.clear(); this.endGesture(true);
+      }
       if (this.act && !this.act.touch) return;              // pencil is down: this is a resting palm
       // A hand landing right after the pencil lifts is a palm, not a scroll.
-      if (!this.touches.size && performance.now() - this.penUpAt < 350) return;
+      if (!this.touches.size && performance.now() - this.penUpAt < 500) return;
       this.touches.set(e.pointerId, { x: e.clientX - this.rect.left, y: e.clientY - this.rect.top });
       if (this.prefs.fingerDraw && this.touches.size === 1 && !this.act) { this.measureOrigin(); this.beginAct(e); return; }
       if (this.act) this.cancelAct();                       // second finger: stop drawing, start pinch
@@ -888,14 +1096,17 @@ class Editor {
       return;
     }
     if (e.pointerType === 'mouse' && e.button !== 0) return;
-    if (this.act) return;
+    // The pencil is touching down, so whatever was in progress is over. (If a pencil-up was lost
+    // this used to leave the editor waiting for it forever, ignoring every new stroke.)
+    if (this.act) this.endAct();
     e.preventDefault();
     if (this.gesture) {                                     // pencil wins over any finger gesture
       const g = this.gesture;
       this.endGesture(true);
-      // A palm that touched down just before the pencil may have dragged the page; put it back.
-      if (!g.pinched && performance.now() - g.t0 < 1000) {
-        this.scale = g.scale; this.tx = g.tx; this.ty = g.ty;
+      // Fingers still down when the pencil lands are the writing hand: undo any scroll or zoom
+      // they caused on the way down.
+      if (performance.now() - g.t0 < 1500) {
+        this.scale = g.v0.scale; this.tx = g.v0.tx; this.ty = g.v0.ty;
         this.clampPan(); this.applyTransform();
       }
     }
@@ -906,6 +1117,12 @@ class Editor {
 
   onMove(e) {
     const a = this.act;
+    if (a && !a.touch && e.pointerType !== 'touch' && e.buttons === 0 && !(e.pressure > 0)) {
+      // The pencil is hovering, so it has lifted without telling us: finish the stroke here.
+      this.penUpAt = performance.now();
+      this.endAct();
+      return;
+    }
     if (a && a.id === e.pointerId) { this.moveAct(e); return; }
     const t = this.touches.get(e.pointerId);
     if (t && this.gesture) {
@@ -931,6 +1148,13 @@ class Editor {
       if (this.touches.size) this.beginGesture(this.gesture.pinched || this.gesture.mode === 'pinch');
       else this.endGesture(false);
     }
+  }
+
+  /* Drops every pointer we are tracking (finishing a stroke in progress). */
+  resetInput() {
+    if (this.act) this.endAct();
+    this.touches.clear();
+    this.endGesture(true);
   }
 
   onWheel(e) {
@@ -988,7 +1212,9 @@ class Editor {
       scale: this.scale, tx: this.tx, ty: this.ty,
       mode: two ? 'pinch' : pinched ? 'pan' : 'undecided', swipe: 0,
       pinched: !!pinched || two,
+      armed: false,
       t0: old ? old.t0 : performance.now(),
+      v0: old ? old.v0 : { scale: this.scale, tx: this.tx, ty: this.ty },   // view before any finger moved it
     };
   }
 
@@ -996,6 +1222,12 @@ class Editor {
     const g = this.gesture, c = this.centroid();
     if (g.mode === 'pinch') {
       if (g.d < 1) return;
+      // Two contacts that barely move are a resting hand, not a pinch.
+      if (!g.armed) {
+        if (Math.abs(c.d - g.d) < 8 && Math.hypot(c.x - g.cx, c.y - g.cy) < 8) return;
+        g.armed = true; g.cx = c.x; g.cy = c.y; g.d = c.d;
+        return;
+      }
       const cw = this.stage.clientWidth, ch = this.stage.clientHeight;
       const min = Math.min((cw - 24) / this.nb.w, (ch - 24) / this.nb.h) * 0.8;
       const s = clamp(g.scale * (c.d / g.d), min, 8);
@@ -1049,6 +1281,7 @@ class Editor {
     let tool = p.tool;
     if (e.pointerType === 'pen' && ((e.buttons & 32) || e.button === 5)) tool = 'eraser';   // pencil eraser end / button
     if (tool === 'eraser') {
+      this.clearSelection();
       this.act = { type: 'erase', id, touch, x, y, changed: false };
       this.eraseAlong(x, y, x, y);
       this.queueLive();
@@ -1162,7 +1395,7 @@ class Editor {
           return;
         }
       }
-      if (snapped) a.s.p = snapped;
+      a.s.p = snapped || simplify(a.s);
       this.pushHistory();
       page.strokes.push(a.s);
       drawStroke(this.ctxOf(this.main), a.s);
@@ -1206,19 +1439,37 @@ class Editor {
   }
 
   eraseAlong(x0, y0, x1, y1) {
-    // Only the inner part of the eraser circle counts, so it has to really pass over the ink.
-    const a = this.act, page = this.page, r = this.prefs.eraserSize * 0.3;
-    const steps = Math.max(1, Math.ceil(Math.hypot(x1 - x0, y1 - y0) / Math.max(r, 1)));
-    let hit = null;
-    for (const s of page.strokes) {
+    const a = this.act, page = this.page, size = this.prefs.eraserSize, len = Math.hypot(x1 - x0, y1 - y0);
+    let next = null;
+    if (this.prefs.eraserMode !== 'stroke') {
+      // Precise: stamp the eraser circle along its path, cutting out whatever lies under it.
+      const R = size / 2, steps = Math.max(1, Math.ceil(len / Math.max(R * 0.5, 0.5)));
+      let list = page.strokes;
       for (let k = 0; k <= steps; k++) {
-        const t = k / steps;
-        if (strokeNear(s, x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, r)) { (hit || (hit = new Set())).add(s); break; }
+        const t = k / steps, x = x0 + (x1 - x0) * t, y = y0 + (y1 - y0) * t;
+        let out = null;
+        for (let i = 0; i < list.length; i++) {
+          const parts = cutStroke(list[i], x, y, R);
+          if (parts) { if (!out) out = list.slice(0, i); for (const q of parts) out.push(q); }
+          else if (out) out.push(list[i]);
+        }
+        if (out) next = list = out;
       }
+    } else {
+      // Whole strokes: only the inner part of the circle counts, so it has to really pass over the ink.
+      const r = size * 0.3, steps = Math.max(1, Math.ceil(len / Math.max(r, 1)));
+      let hit = null;
+      for (const s of page.strokes) {
+        for (let k = 0; k <= steps; k++) {
+          const t = k / steps;
+          if (strokeNear(s, x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, r)) { (hit || (hit = new Set())).add(s); break; }
+        }
+      }
+      if (hit) next = page.strokes.filter((s) => !hit.has(s));
     }
-    if (!hit) return;
+    if (!next) return;
     if (!a.changed) { this.pushHistory(); a.changed = true; }
-    page.strokes = page.strokes.filter((s) => !hit.has(s));
+    page.strokes = next;
     this.renderMain();
   }
 
@@ -1819,7 +2070,7 @@ class InkbookView extends obsidian.TextFileView {
 
   getViewData() {
     // If the file could not be parsed, hand its original text back untouched.
-    return this.broken !== null ? this.broken : JSON.stringify(this.editor.nb);
+    return this.broken !== null ? this.broken : serializeNotebook(this.editor.nb);
   }
 
   setViewData(data, clear) {
@@ -1976,7 +2227,7 @@ class InkbookPlugin extends obsidian.Plugin {
     const dir = folder.path === '/' ? '' : folder.path + '/';
     let path = obsidian.normalizePath(`${dir}${name}.${EXT}`);
     for (let i = 1; this.app.vault.getAbstractFileByPath(path); i++) path = obsidian.normalizePath(`${dir}${name} ${i}.${EXT}`);
-    const file = await this.app.vault.create(path, JSON.stringify(newNotebook(this.settings, opts)));
+    const file = await this.app.vault.create(path, serializeNotebook(newNotebook(this.settings, opts)));
     await this.app.workspace.getLeaf(true).openFile(file);
   }
 }
@@ -1984,4 +2235,4 @@ class InkbookPlugin extends obsidian.Plugin {
 module.exports = InkbookPlugin;
 // Exposed for the browser test harness (dev/index.html).
 InkbookPlugin.Editor = Editor;
-InkbookPlugin.internals = { DEFAULT_PREFS, parseNotebook, newNotebook, buildPdf, isScribble, recognize };
+InkbookPlugin.internals = { DEFAULT_PREFS, parseNotebook, serializeNotebook, newNotebook, buildPdf, isScribble, recognize, simplify, cutStroke, piece };
