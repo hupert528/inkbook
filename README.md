@@ -1,7 +1,7 @@
 # Inkbook
 
 Lightweight handwritten notebooks for Obsidian, built for iPad + Apple Pencil.
-One file (`main.js`, about 50 KB), no dependencies, no build step.
+One file (`main.js`, about 100 KB), no dependencies, no build step.
 
 ## Install
 
@@ -22,8 +22,11 @@ needed if you paste directly into `.obsidian/plugins`). With Obsidian Sync, enab
 - **Pencil draws, fingers navigate.** One finger scrolls a zoomed page, two fingers pinch-zoom.
 - **Pages:** swipe sideways with a finger to turn pages. On the last page, keep swiping
   (right-to-left, like turning a page forward) until "Release for new page" appears.
-- **Page style** (grid button): squared, lined, dotted, blank; grid size; white or cream paper.
-- **Erase:** scribble back and forth over ink with the pen, or use the eraser tool.
+- **Settings** (gear button): page style (squared, lined, dotted, blank), grid size, white or cream
+  paper, and the pencil options (draw with finger, scribble to erase, hold to straighten).
+- **Erase:** scribble back and forth over ink with the pen, or use the eraser tool. The eraser has
+  two modes: **Precise** rubs out only the ink under the circle (cutting strokes in two where
+  needed); **Stroke** removes every stroke it passes over.
 - **Straight lines and circles:** draw, then hold the pencil still for half a second — or use the
   shape pen, which always corrects.
 - **Lasso:** circle some ink, then drag it to move, or use the popup to copy / cut / duplicate /
@@ -39,6 +42,15 @@ needed if you paste directly into `.obsidian/plugins`). With Obsidian Sync, enab
   iPad the share sheet opens too.
 
 Defaults (page style, stabilisation strength, pressure, finger drawing…) are in Settings → Inkbook.
+
+## File size
+
+Notebooks are small text files. Ink is thinned to the points that matter when you lift the pencil
+and stored packed (file format version 2), which comes to roughly 100–150 bytes per pen
+stroke — a densely written page is in the region of 100–200 KB. Notebooks made with
+earlier versions open as usual and are rewritten in the compact format (about 5–7× smaller) the next
+time you change them. Update the plugin on all your devices: a device still on an older version
+will refuse to open a compact notebook (it leaves the file untouched).
 
 ## Testing without Obsidian
 

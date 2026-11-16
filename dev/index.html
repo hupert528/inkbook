@@ -36,7 +36,7 @@
   const host = {
     prefs,
     savePrefs() {},
-    changed() { localStorage.setItem(KEY, JSON.stringify(editor.nb)); },
+    changed() { localStorage.setItem(KEY, T.serializeNotebook(editor.nb)); },
     setIcon(el, names) { el.textContent = names.split('|')[0].slice(0, 5); },
     menu(items, evt) {
       const m = document.createElement('div'); m.className = 'menu';

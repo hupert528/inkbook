@@ -77,9 +77,11 @@
 }
 
 .inkbook-root .inkbook-swatch {
+  box-sizing: border-box;
+  flex: none;
   width: 24px;
   height: 24px;
-  min-width: 24px;
+  aspect-ratio: 1;
   margin: 0 3px;
   padding: 0;
   border-radius: 50%;
@@ -92,24 +94,41 @@
   box-shadow: 0 0 0 2px var(--interactive-accent, #6d5ae6);
 }
 
-.inkbook-root input.inkbook-custom {
-  -webkit-appearance: none;
-  appearance: none;
+.inkbook-root .inkbook-custom {
+  position: relative;
   overflow: hidden;
   background: conic-gradient(#f43f5e, #f59e0b, #22c55e, #06b6d4, #6366f1, #d946ef, #f43f5e);
 }
 
-.inkbook-root input.inkbook-custom::-webkit-color-swatch-wrapper {
+.inkbook-root .inkbook-custom input {
+  position: absolute;
+  left: -50%;
+  top: -50%;
+  width: 200%;
+  height: 200%;
+  min-width: 0;
+  margin: 0;
   padding: 0;
-}
-
-.inkbook-root input.inkbook-custom::-webkit-color-swatch {
   border: none;
   opacity: 0;
+  cursor: pointer;
 }
 
-.inkbook-root input.inkbook-custom.is-active::-webkit-color-swatch {
-  opacity: 1;
+.inkbook-root button.inkbook-seg {
+  height: 28px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  box-shadow: none;
+  font-size: 13px;
+  color: var(--text-muted, #555);
+  cursor: pointer;
+}
+
+.inkbook-root button.inkbook-seg.is-active {
+  background: var(--interactive-accent, #6d5ae6);
+  color: var(--text-on-accent, #fff);
 }
 
 .inkbook-pagelabel {
@@ -158,7 +177,6 @@
 .inkbook-root .inkbook-swatch.is-current {
   width: 28px;
   height: 28px;
-  min-width: 28px;
 }
 
 .inkbook-colorpop {
@@ -173,7 +191,7 @@
   box-shadow: 0 4px 18px rgba(0, 0, 0, 0.25);
 }
 
-.inkbook-colorpop .inkbook-swatch {
+.inkbook-root .inkbook-colorpop .inkbook-swatch {
   width: 28px;
   height: 28px;
   margin: 0;
