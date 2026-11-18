@@ -20,12 +20,17 @@ const HL_COLORS = ['#fde047', '#86efac', '#f9a8d4', '#93c5fd', '#fdba74'];
 const PEN_SIZES = [1.1, 1.8, 3];
 const HL_SIZES = [8, 13, 20];
 const ERASER_SIZES = [8, 16, 30];
-const MAX_CANVAS_PX = 8e6;                  // keeps memory low and stays under iOS canvas limits
+const TEXT_SIZES = [12, 16, 24];
+const MAX_CANVAS_PX = 8e6;
+const MAX_PIC = 2000;                       // pictures are stored at most this many pixels across
+const MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', svg: 'image/svg+xml', heic: 'image/heic' };
+const PIC_EXTS = Object.keys(MIME);                  // keeps memory low and stays under iOS canvas limits
 
 const DEFAULT_PREFS = {
   tool: 'pen',
   penColor: PEN_COLORS[0], hlColor: HL_COLORS[0],
   penSize: PEN_SIZES[1], hlSize: HL_SIZES[1], eraserSize: ERASER_SIZES[1],
+  textSize: TEXT_SIZES[1],
   eraserMode: 'precise',                    // 'precise' rubs out only what is under the circle; 'stroke' removes whole strokes
   fingerDraw: false, scribbleErase: true, holdSnap: true, pressure: true,
   stabilize: 0.4,
@@ -102,13 +107,33 @@ function unpackPoints(str) {
   return p;
 }
 
+const num = (v, d) => (Number.isFinite(+v) ? +v : d);
+
+/* Text boxes { k:'text', x, y, w, size, c, text, rot } and pictures { k:'img', x, y, w, h, src, rot }:
+   x, y is the top-left corner before rotation; rot (radians) turns the box about its centre. */
+function cleanItem(it) {
+  if (!it || typeof it !== 'object') return null;
+  const base = { x: r2(num(it.x, 0)), y: r2(num(it.y, 0)), rot: num(it.rot, 0) };
+  if (it.k === 'text' && typeof it.text === 'string') {
+    return Object.assign({ k: 'text' }, base, { w: Math.max(20, r2(num(it.w, 200))), size: clamp(r2(num(it.size, 16)), 2, 400), c: String(it.c || '#1a1a1a'), text: it.text });
+  }
+  if (it.k === 'img' && typeof it.src === 'string') {
+    const w = num(it.w, 0), h = num(it.h, 0);
+    if (!(w > 0 && h > 0)) return null;
+    return Object.assign({ k: 'img' }, base, { w: r2(w), h: r2(h), src: it.src });
+  }
+  return null;
+}
+
 const packCache = new WeakMap();              // strokes are never changed in place once on a page
 
 function serializeNotebook(nb) {
   const styles = [], index = new Map();
+  let hasItems = false;
   const pg = nb.pages.map((page) => {
     const o = { id: page.id, tpl: page.tpl };
     if (page.bg) o.bg = page.bg;
+    if (page.items && page.items.length) { o.items = page.items; hasItems = true; }
     o.ink = [];
     for (const s of page.strokes) {
       const key = s.t + '|' + s.c + '|' + s.w;
@@ -122,14 +147,15 @@ function serializeNotebook(nb) {
   });
   // The page list is called `pg`, not `pages`, so an older copy of the plugin on another device
   // refuses the file (and leaves it untouched) instead of opening it as an empty notebook.
-  return JSON.stringify({ version: 2, w: nb.w, h: nb.h, spacing: nb.spacing, paper: nb.paper, styles, pg });
+  // Text boxes and pictures need version 3; without them the file stays readable by version 2 plugins.
+  return JSON.stringify({ version: hasItems ? 3 : 2, w: nb.w, h: nb.h, spacing: nb.spacing, paper: nb.paper, styles, pg });
 }
 
 function parseNotebook(text, prefs) {
   if (!text || !text.trim()) return newNotebook(prefs);
   const d = JSON.parse(text);
   if (!d || typeof d !== 'object') throw new Error('Not an Inkbook notebook');
-  if (d.version > 2) throw new Error('it was made by a newer version of Inkbook — update the plugin on this device');
+  if (d.version > 3) throw new Error('it was made by a newer version of Inkbook — update the plugin on this device');
   const v2 = Array.isArray(d.pg);
   if (!v2 && !Array.isArray(d.pages)) throw new Error('Not an Inkbook notebook');
   const nb = {
@@ -141,6 +167,10 @@ function parseNotebook(text, prefs) {
     if (!src) continue;
     const page = { id: src.id || uid(), tpl: TEMPLATES[src.tpl] ? src.tpl : 'squared', strokes: [] };
     if (src.bg && typeof src.bg.src === 'string' && src.bg.n >= 1) page.bg = { src: src.bg.src, n: src.bg.n };   // imported PDF page
+    if (Array.isArray(src.items)) {
+      const items = src.items.map(cleanItem).filter(Boolean);
+      if (items.length) page.items = items;
+    }
     if (v2) {
       const ink = Array.isArray(src.ink) ? src.ink : [];
       for (let i = 0; i + 1 < ink.length; i += 2) {
@@ -471,6 +501,113 @@ function drawStroke(ctx, s) {
   if (hl) { ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; }
 }
 
+/* ---------- text boxes and pictures ---------- */
+
+const TEXT_FONT = 'Helvetica, Arial, sans-serif', TEXT_LH = 1.3, TEXT_PAD = 3;
+let measureCtx = null;
+const layoutCache = new WeakMap();
+
+function wrapPara(ctx, para, max, out) {
+  let line = '';
+  for (let tok of para.match(/\S+|\s+/g) || []) {
+    if (/^\s/.test(tok)) { if (line) line += tok.replace(/\t/g, '    '); continue; }
+    if (ctx.measureText(line + tok).width <= max) { line += tok; continue; }
+    if (line.trim()) { out.push(line.trimEnd()); line = ''; }
+    while (tok.length > 1 && ctx.measureText(tok).width > max) {     // a word wider than the box
+      let n = tok.length - 1;
+      while (n > 1 && ctx.measureText(tok.slice(0, n)).width > max) n--;
+      out.push(tok.slice(0, n)); tok = tok.slice(n);
+    }
+    line = tok;
+  }
+  out.push(line.trimEnd());
+}
+
+/* Lines of a text box, wrapped to its width, and the box height. */
+function textLayout(it) {
+  let L = layoutCache.get(it);
+  if (L) return L;
+  if (!measureCtx) measureCtx = document.createElement('canvas').getContext('2d');
+  measureCtx.font = `${it.size}px ${TEXT_FONT}`;
+  const lines = [];
+  for (const para of it.text.split('\n')) wrapPara(measureCtx, para, Math.max(1, it.w - 2 * TEXT_PAD), lines);
+  L = { lines, h: 2 * TEXT_PAD + lines.length * it.size * TEXT_LH };
+  layoutCache.set(it, L);
+  return L;
+}
+
+const itemH = (it) => (it.k === 'text' ? textLayout(it).h : it.h);
+
+/* Maps a point given in the item's unrotated frame onto the page. */
+function itemPt(it, x, y) {
+  const h = itemH(it), cx = it.x + it.w / 2, cy = it.y + h / 2;
+  if (!it.rot) return [x, y];
+  const c = Math.cos(it.rot), s = Math.sin(it.rot), dx = x - cx, dy = y - cy;
+  return [cx + c * dx - s * dy, cy + s * dx + c * dy];
+}
+
+function itemBox(it) {
+  let b = boxCache.get(it);
+  if (!b) {
+    const h = itemH(it), pts = [itemPt(it, it.x, it.y), itemPt(it, it.x + it.w, it.y), itemPt(it, it.x + it.w, it.y + h), itemPt(it, it.x, it.y + h)];
+    b = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
+    for (const [x, y] of pts) { b.x0 = Math.min(b.x0, x); b.y0 = Math.min(b.y0, y); b.x1 = Math.max(b.x1, x); b.y1 = Math.max(b.y1, y); }
+    boxCache.set(it, b);
+  }
+  return b;
+}
+
+const boxOf = (o) => (o.p ? strokeBox(o) : itemBox(o));
+
+function itemCenter(it) { return [it.x + it.w / 2, it.y + itemH(it) / 2]; }
+
+function itemHit(it, x, y, m) {
+  const [cx, cy] = itemCenter(it), c = Math.cos(-(it.rot || 0)), s = Math.sin(-(it.rot || 0));
+  const dx = x - cx, dy = y - cy, lx = c * dx - s * dy, ly = s * dx + c * dy;
+  return Math.abs(lx) <= it.w / 2 + m && Math.abs(ly) <= itemH(it) / 2 + m;
+}
+
+function withItemFrame(ctx, it, fn) {
+  ctx.save();
+  if (it.rot) {
+    const [cx, cy] = itemCenter(it);
+    ctx.translate(cx, cy); ctx.rotate(it.rot); ctx.translate(-cx, -cy);
+  }
+  fn();
+  ctx.restore();
+}
+
+function drawText(ctx, it) {
+  const L = textLayout(it);
+  withItemFrame(ctx, it, () => {
+    ctx.font = `${it.size}px ${TEXT_FONT}`; ctx.fillStyle = it.c; ctx.textBaseline = 'alphabetic';
+    ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+    L.lines.forEach((ln, i) => { if (ln) ctx.fillText(ln, it.x + TEXT_PAD, it.y + TEXT_PAD + it.size * (i * TEXT_LH + 1)); });
+  });
+}
+
+/* img: a decoded image, or null while loading / if the file is missing (a grey box shows instead). */
+function drawPicture(ctx, it, img) {
+  withItemFrame(ctx, it, () => {
+    ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+    if (img) { ctx.drawImage(img, it.x, it.y, it.w, it.h); return; }
+    ctx.fillStyle = '#ececef'; ctx.fillRect(it.x, it.y, it.w, it.h);
+    ctx.strokeStyle = '#b8b8c0'; ctx.lineWidth = 1; ctx.strokeRect(it.x, it.y, it.w, it.h);
+  });
+}
+
+/* Moves / scales / rotates an item by the affine matrix M (uniform scale k). */
+function transformItem(it, M, k) {
+  const [cx, cy] = itemCenter(it), h = itemH(it) * k, w = it.w * k;
+  const nx = M[0] * cx + M[2] * cy + M[4], ny = M[1] * cx + M[3] * cy + M[5];
+  let rot = (it.rot || 0) + Math.atan2(M[1], M[0]);
+  rot = Math.atan2(Math.sin(rot), Math.cos(rot));
+  if (Math.abs(rot) < 1e-4) rot = 0;
+  const o = Object.assign({}, it, { x: r2(nx - w / 2), y: r2(ny - h / 2), w: r2(w), rot });
+  if (it.k === 'text') o.size = r2(it.size * k); else o.h = r2(h);
+  return o;
+}
+
 /* ------------------------------------------------------------------ */
 /* PDF export — tiny hand-rolled vector PDF writer                     */
 /* ------------------------------------------------------------------ */
@@ -508,8 +645,26 @@ function pdfStroke(o, s) {
   if (hl) o.push('Q');
 }
 
-function pdfPage(nb, page, img) {
-  const o = [], paper = PAPERS[nb.paper] || PAPERS.white, g = templateGeom(nb, page);
+/* PDF string in the standard WinAnsi encoding (Western European characters; anything else becomes ?). */
+const WIN = { 0x20ac: 0x80, 0x2026: 0x85, 0x2018: 0x91, 0x2019: 0x92, 0x201c: 0x93, 0x201d: 0x94, 0x2022: 0x95, 0x2013: 0x96, 0x2014: 0x97, 0x2122: 0x99 };
+function pdfText(str) {
+  let o = '(';
+  for (const ch of str) {
+    let c = ch.codePointAt(0);
+    if (c === 9) c = 32;
+    if (c === 40 || c === 41 || c === 92) o += '\\' + ch;
+    else if (c >= 32 && c < 127) o += ch;
+    else {
+      c = c >= 160 && c <= 255 ? c : WIN[c] || 63;
+      o += '\\' + c.toString(8).padStart(3, '0');
+    }
+  }
+  return o + ')';
+}
+
+/* bg: the imported PDF page as an image ({ fit }) or null; pics: Map picture src -> XObject name. */
+function pdfPage(nb, page, bg, pics) {
+  const o = [], paper = PAPERS[nb.paper] || PAPERS.white, g = templateGeom(nb, page), items = page.items || [];
   o.push(`1 0 0 -1 0 ${f2(nb.h)} cm`);                       // flip so y grows downward like the canvas
   o.push(`${hexRgb(paper.bg)} rg 0 0 ${f2(nb.w)} ${f2(nb.h)} re f`);
   if (g.lines.length) {
@@ -522,9 +677,31 @@ function pdfPage(nb, page, img) {
     for (let i = 0; i < g.dots.length; i += 2) o.push(`${f2(g.dots[i] - 0.6)} ${f2(g.dots[i + 1] - 0.6)} 1.2 1.2 re`);
     o.push('f');
   }
-  if (img) {                                                  // imported PDF page, drawn upright
-    const f = img.fit;
+  if (bg) {                                                   // imported PDF page, drawn upright
+    const f = bg.fit;
     o.push(`q ${f2(f.w)} 0 0 ${f2(-f.h)} ${f2(f.x)} ${f2(f.y + f.h)} cm /Im0 Do Q`);
+  }
+  for (const it of items) {                                   // pictures (below the ink, like on screen)
+    if (it.k !== 'img') continue;
+    const c = Math.cos(it.rot || 0), sn = Math.sin(it.rot || 0), [cx, cy] = itemCenter(it), w = it.w, h = it.h;
+    const name = pics && pics.get(it.src);
+    if (name) {
+      o.push(`q ${f2(w * c)} ${f2(w * sn)} ${f2(h * sn)} ${f2(-h * c)} ${f2(cx - (w / 2) * c - (h / 2) * sn)} ${f2(cy - (w / 2) * sn + (h / 2) * c)} cm /${name} Do Q`);
+    } else {
+      const p = [[it.x, it.y], [it.x + w, it.y], [it.x + w, it.y + h], [it.x, it.y + h]].map(([x, y]) => itemPt(it, x, y));
+      o.push(`0.93 0.93 0.94 rg ${f2(p[0][0])} ${f2(p[0][1])} m ${p.slice(1).map((q) => `${f2(q[0])} ${f2(q[1])} l`).join(' ')} h f`);
+    }
+  }
+  for (const it of items) {                                   // text boxes
+    if (it.k !== 'text') continue;
+    const L = textLayout(it), c = Math.cos(it.rot || 0), sn = Math.sin(it.rot || 0);
+    o.push(`BT /F1 ${f2(it.size)} Tf ${hexRgb(it.c)} rg`);
+    L.lines.forEach((ln, i) => {
+      if (!ln) return;
+      const [x, y] = itemPt(it, it.x + TEXT_PAD, it.y + TEXT_PAD + it.size * (i * TEXT_LH + 1));
+      o.push(`${f2(c)} ${f2(sn)} ${f2(sn)} ${f2(-c)} ${f2(x)} ${f2(y)} Tm ${pdfText(ln)} Tj`);
+    });
+    o.push('ET');
   }
   o.push('1 J 1 j');
   for (const s of page.strokes) pdfStroke(o, s);
@@ -539,40 +716,44 @@ async function deflate(bytes) {
   } catch (e) { return null; }
 }
 
-/* pages: indices to include (default all). images: Map index -> { bytes (JPEG), w, h, fit } for
-   pages that have an imported PDF page behind the ink. */
-async function buildPdf(nb, pages, images) {
+/* pages: indices to include (default all). bgs: Map index -> { bytes (JPEG), w, h, fit } for pages
+   with an imported PDF page behind the ink. pics: Map picture src -> { bytes (JPEG), w, h }. */
+async function buildPdf(nb, pages, bgs, pics) {
   const enc = new TextEncoder(), chunks = [], offsets = [];
-  let size = 0;
+  let size = 0, next = 1;
   const put = (d) => { const b = typeof d === 'string' ? enc.encode(d) : d; chunks.push(b); size += b.length; };
   const obj = (id, body) => { offsets[id] = size; put(`${id} 0 obj\n${body}\nendobj\n`); };
-  const list = pages || nb.pages.map((_, i) => i), n = list.length;
-  images = images || new Map();
+  const stream = (id, dict, data) => { offsets[id] = size; put(`${id} 0 obj\n<< ${dict} /Length ${data.length} >>\nstream\n`); put(data); put('\nendstream\nendobj\n'); };
+  const jpeg = (id, im) => stream(id, `/Type /XObject /Subtype /Image /Width ${im.w} /Height ${im.h} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode`, im.bytes);
+  const list = pages || nb.pages.map((_, i) => i);
+  bgs = bgs || new Map(); pics = pics || new Map();
+  const CAT = next++, PAGES = next++, FONT = next++;
+  const picIds = new Map(), picNames = new Map();
+  for (const src of pics.keys()) { picIds.set(src, next++); picNames.set(src, 'P' + picNames.size); }
+  const ids = list.map((i) => ({ page: next++, content: next++, bg: bgs.has(i) ? next++ : 0 }));
   put('%PDF-1.4\n'); put(new Uint8Array([37, 226, 227, 207, 211, 10]));
-  obj(1, '<< /Type /Catalog /Pages 2 0 R >>');
-  obj(2, `<< /Type /Pages /Count ${n} /Kids [${list.map((_, i) => `${3 + 3 * i} 0 R`).join(' ')}] >>`);
-  for (let i = 0; i < n; i++) {
-    const pid = 3 + 3 * i, cid = pid + 1, iid = pid + 2, img = images.get(list[i]);
-    const raw = enc.encode(pdfPage(nb, nb.pages[list[i]], img));
+  obj(CAT, `<< /Type /Catalog /Pages ${PAGES} 0 R >>`);
+  obj(PAGES, `<< /Type /Pages /Count ${list.length} /Kids [${ids.map((d) => `${d.page} 0 R`).join(' ')}] >>`);
+  obj(FONT, '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>');
+  for (const [src, im] of pics) jpeg(picIds.get(src), im);
+  for (let k = 0; k < list.length; k++) {
+    const page = nb.pages[list[k]], d = ids[k], bg = bgs.get(list[k]);
+    const used = new Set((page.items || []).filter((it) => it.k === 'img' && picIds.has(it.src)).map((it) => it.src));
+    const xo = [];
+    if (bg) xo.push(`/Im0 ${d.bg} 0 R`);
+    for (const src of used) xo.push(`/${picNames.get(src)} ${picIds.get(src)} 0 R`);
+    const raw = enc.encode(pdfPage(nb, page, bg, picNames));
     const packed = await deflate(raw);
-    const data = packed || raw;
-    obj(pid, `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${f2(nb.w)} ${f2(nb.h)}] ` +
+    obj(d.page, `<< /Type /Page /Parent ${PAGES} 0 R /MediaBox [0 0 ${f2(nb.w)} ${f2(nb.h)}] ` +
       `/Resources << /ExtGState << /GH << /Type /ExtGState /CA ${HL_ALPHA} /ca ${HL_ALPHA} /BM /Multiply >> >>` +
-      `${img ? ` /XObject << /Im0 ${iid} 0 R >>` : ''} >> /Contents ${cid} 0 R >>`);
-    offsets[cid] = size;
-    put(`${cid} 0 obj\n<< /Length ${data.length}${packed ? ' /Filter /FlateDecode' : ''} >>\nstream\n`);
-    put(data); put('\nendstream\nendobj\n');
-    if (img) {
-      offsets[iid] = size;
-      put(`${iid} 0 obj\n<< /Type /XObject /Subtype /Image /Width ${img.w} /Height ${img.h} /ColorSpace /DeviceRGB ` +
-        `/BitsPerComponent 8 /Filter /DCTDecode /Length ${img.bytes.length} >>\nstream\n`);
-      put(img.bytes); put('\nendstream\nendobj\n');
-    } else obj(iid, 'null');
+      ` /Font << /F1 ${FONT} 0 R >>${xo.length ? ` /XObject << ${xo.join(' ')} >>` : ''} >> /Contents ${d.content} 0 R >>`);
+    stream(d.content, packed ? '/Filter /FlateDecode' : '', packed || raw);
+    if (bg) jpeg(d.bg, bg);
   }
-  const count = 2 + 3 * n, xref = size;
+  const count = next - 1, xref = size;
   put(`xref\n0 ${count + 1}\n0000000000 65535 f \n`);
   for (let id = 1; id <= count; id++) put(String(offsets[id]).padStart(10, '0') + ' 00000 n \n');
-  put(`trailer\n<< /Size ${count + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`);
+  put(`trailer\n<< /Size ${count + 1} /Root ${CAT} 0 R >>\nstartxref\n${xref}\n%%EOF\n`);
   const out = new Uint8Array(size);
   let at = 0;
   for (const c of chunks) { out.set(c, at); at += c.length; }
@@ -594,7 +775,8 @@ const TOOLS = [
   ['pen', 'pencil', 'Pen'],
   ['highlighter', 'highlighter', 'Highlighter'],
   ['eraser', 'eraser', 'Eraser'],
-  ['lasso', 'lasso', 'Lasso select'],
+  ['lasso', 'lasso', 'Lasso select (tap ink, a picture or text to select it)'],
+  ['text', 'type', 'Text box'],
   ['shape', 'shapes|circle', 'Shape pen (lines and circles)'],
 ];
 
@@ -621,6 +803,10 @@ class Editor {
     this.bgHi = null; this.bgPending = null; this.bgToken = 0; this.bgTimer = 0;
     this.ov = null;                   // page overview, when open
     this.bgWaiters = new Map();
+    this.imgs = new Map();            // picture src -> { img, failed, url, waiters }
+    this.textEd = null;               // text box being typed in
+    this.imgRedraw = () => this.renderMain();
+    this.liveRedraw = () => this.queueLive();
 
     this.root = el('div', 'inkbook-root', parent);
     this.root.tabIndex = -1;
@@ -650,7 +836,7 @@ class Editor {
     // swallows its pointer events until the pencil lifts.
     st.addEventListener('touchstart', (e) => {
       e.stopPropagation();
-      if (!this.selBar.contains(e.target)) e.preventDefault();
+      if (!this.selBar.contains(e.target) && !this.inTextEditor(e.target)) e.preventDefault();
     }, { passive: false });
     // overflow:hidden boxes can still be scrolled by the browser; any scroll would shift the page
     // away from where the pen maths thinks it is.
@@ -660,16 +846,24 @@ class Editor {
     this.root.addEventListener('paste', (e) => this.onPaste(e));
     this.ro = new ResizeObserver(() => this.layout());
     this.ro.observe(st);
-    // If the app loses focus mid-stroke the pencil-up may never arrive; start clean when it returns.
-    this.onBlur = () => this.resetInput();
-    window.addEventListener('blur', this.onBlur);
-    document.addEventListener('visibilitychange', this.onBlur);
+    // If the app is put away mid-stroke the pencil-up may never arrive; start clean when it returns.
+    this.onHide = () => { if (document.hidden) this.resetInput(); };
+    document.addEventListener('visibilitychange', this.onHide);
+    // While the pencil is writing, no other touch anywhere on screen may do anything. A palm resting
+    // on the toolbar or on Obsidian's own bars could otherwise start a scroll or swipe there, and
+    // iPadOS then cancels every touch in progress — including the pencil, ending the stroke.
+    this.guard = (e) => { if (this.act && !this.act.touch && e.cancelable) e.preventDefault(); };
+    document.addEventListener('touchstart', this.guard, { passive: false, capture: true });
+    document.addEventListener('touchmove', this.guard, { passive: false, capture: true });
   }
 
   destroy() {
     this.ro.disconnect();
-    window.removeEventListener('blur', this.onBlur);
-    document.removeEventListener('visibilitychange', this.onBlur);
+    document.removeEventListener('visibilitychange', this.onHide);
+    document.removeEventListener('touchstart', this.guard, true);
+    document.removeEventListener('touchmove', this.guard, true);
+    this.closeText(true);
+    for (const e of this.imgs.values()) if (e.url) URL.revokeObjectURL(e.url);
     this.closeColors();
     this.closeOverview();
     clearTimeout(this.resTimer); clearTimeout(this.bgTimer);
@@ -685,6 +879,7 @@ class Editor {
     const resized = nb.w !== this.nb.w || nb.h !== this.nb.h;
     this.nb = nb;
     this.pageIndex = clamp(this.pageIndex, 0, nb.pages.length - 1);
+    this.closeText(true);
     this.undoStack = []; this.redoStack = [];
     this.act = null; this.dropSelection();
     if (resized) { this.ready = false; this.rv = null; }
@@ -714,6 +909,10 @@ class Editor {
     this.undoBtn = this.btn(g2, 'undo-2|undo', 'Undo', () => this.undo());
     this.redoBtn = this.btn(g2, 'redo-2|redo', 'Redo', () => this.redo());
     this.pasteBtn = this.btn(g2, 'clipboard-paste|clipboard', 'Paste', () => this.paste());
+    this.btn(g2, 'image-plus|image', 'Insert picture', (e) => this.host.menu([
+      { title: 'Photo or file from this device…', icon: 'camera', click: () => this.pickDeviceImage() },
+      { title: 'Picture from the vault…', icon: 'image', click: () => this.pickVaultImage() },
+    ], e));
     el('div', 'inkbook-spacer', t);
     const g3 = el('div', 'inkbook-group', t);
     this.prevBtn = this.btn(g3, 'chevron-left', 'Previous page', () => this.goTo(this.pageIndex - 1, -1));
@@ -750,15 +949,25 @@ class Editor {
     }
 
     this.sizes.textContent = '';
-    const key = tool === 'highlighter' ? 'hlSize' : tool === 'eraser' ? 'eraserSize' : tool === 'lasso' ? null : 'penSize';
-    if (key) {
-      const list = key === 'hlSize' ? HL_SIZES : key === 'eraserSize' ? ERASER_SIZES : PEN_SIZES;
+    const key = { highlighter: 'hlSize', eraser: 'eraserSize', lasso: null, text: 'textSize' }[tool];
+    if (key !== null) {
+      const k = key || 'penSize';
+      const list = { hlSize: HL_SIZES, eraserSize: ERASER_SIZES, textSize: TEXT_SIZES, penSize: PEN_SIZES }[k];
       list.forEach((v, i) => {
-        const b = el('button', 'inkbook-btn inkbook-size' + (p[key] === v ? ' is-active' : ''), this.sizes);
-        b.setAttribute('aria-label', ['Thin', 'Medium', 'Thick'][i]);
-        const d = el('div', 'inkbook-dot', b);
-        d.style.width = d.style.height = 5 + i * 5 + 'px';
-        b.addEventListener('click', () => { p[key] = v; this.host.savePrefs(); this.refreshToolbar(); });
+        const b = el('button', 'inkbook-btn inkbook-size' + (p[k] === v ? ' is-active' : ''), this.sizes);
+        if (k === 'textSize') {
+          b.setAttribute('aria-label', ['Small text', 'Medium text', 'Large text'][i]);
+          const d = el('div', 'inkbook-aa', b);
+          d.textContent = 'A'; d.style.fontSize = 11 + i * 4 + 'px';
+        } else {
+          b.setAttribute('aria-label', ['Thin', 'Medium', 'Thick'][i]);
+          const d = el('div', 'inkbook-dot', b);
+          d.style.width = d.style.height = 5 + i * 5 + 'px';
+        }
+        b.addEventListener('click', () => {
+          p[k] = v; this.host.savePrefs(); this.refreshToolbar();
+          if (k === 'textSize') this.restyleText({ size: v });
+        });
       });
     }
     this.refreshState();
@@ -813,6 +1022,7 @@ class Editor {
   }
 
   setTool(tool) {
+    this.closeText();
     if (tool !== 'lasso') this.clearSelection();
     this.prefs.tool = tool;
     this.host.savePrefs();
@@ -822,9 +1032,10 @@ class Editor {
   setColor(c) {
     if (this.sel.size) {
       this.pushHistory();
-      this.transformSel((s) => Object.assign({}, s, { c }));
+      this.transformSel((s) => (s.k === 'img' ? s : Object.assign({}, s, { c })));
       this.queueLive(); this.changed();
     }
+    this.restyleText({ c });
     this.prefs[this.prefs.tool === 'highlighter' ? 'hlColor' : 'penColor'] = c;
     this.host.savePrefs();
     this.refreshToolbar();
@@ -855,6 +1066,9 @@ class Editor {
       '-',
       { title: 'Import PDF from vault…', icon: 'file-input', click: () => this.pickVaultPdf() },
       { title: 'Import PDF from device…', icon: 'upload', click: () => this.pickDevicePdf() },
+      '-',
+      { title: 'Insert picture from device…', icon: 'image-plus', click: () => this.pickDeviceImage() },
+      { title: 'Insert picture from vault…', icon: 'image', click: () => this.pickVaultImage() },
       '-',
       { title: 'Zoom to fit', icon: 'maximize', click: () => { this.fit(); this.applyTransform(); this.render(); } },
       { title: 'Clear page', icon: 'eraser', click: () => this.clearPage() },
@@ -912,7 +1126,7 @@ class Editor {
       const t = `translate(${this.tx - v.tx * k}px,${this.ty - v.ty * k}px) scale(${k})`;
       this.main.style.transform = this.live.style.transform = t;
     }
-    this.placeSelBar();
+    this.placeSelBar(); this.placeText();
     if (v && (v.s !== this.scale || v.tx !== this.tx || v.ty !== this.ty)) this.renderSoon();
   }
 
@@ -974,13 +1188,25 @@ class Editor {
     if (page.bg) this.drawBg(ctx, page.bg);
     const v = this.rv, W = this.main.width / v.k, H = this.main.height / v.k;   // skip off-screen ink
     const x0 = (-v.mx - v.tx) / v.s, y0 = (-v.my - v.ty) / v.s, x1 = x0 + W / v.s, y1 = y0 + H / v.s;
-    for (const s of page.strokes) {
-      if (this.sel.has(s)) continue;
-      const b = strokeBox(s);
-      if (b.x1 < x0 || b.x0 > x1 || b.y1 < y0 || b.y0 > y1) continue;
-      drawStroke(ctx, s);
-    }
+    const ed = this.textEd && this.textEd.orig;
+    this.drawContent(ctx, page, (o) => this.sel.has(o) || o === ed, [x0, y0, x1, y1], this.imgRedraw);
     ctx.restore();
+  }
+
+  /* Pictures, then text boxes, then ink — so you can write on top of both. skip(o) leaves
+     something out; view [x0, y0, x1, y1] skips what is off screen; onImg runs once a picture
+     that was still loading is ready. */
+  drawContent(ctx, page, skip, view, onImg) {
+    const vis = (o) => {
+      if (skip && skip(o)) return false;
+      if (!view) return true;
+      const b = boxOf(o);
+      return !(b.x1 < view[0] || b.x0 > view[2] || b.y1 < view[1] || b.y0 > view[3]);
+    };
+    const items = page.items || [];
+    for (const it of items) if (it.k === 'img' && vis(it)) drawPicture(ctx, it, this.image(it.src, onImg));
+    for (const it of items) if (it.k === 'text' && vis(it)) drawText(ctx, it);
+    for (const s of page.strokes) if (vis(s)) drawStroke(ctx, s);
   }
 
   clearLive() {
@@ -1005,7 +1231,7 @@ class Editor {
       const M = this.selM;
       ctx.save();
       if (M) ctx.transform(M[0], M[1], M[2], M[3], M[4], M[5]);
-      for (const s of this.page.strokes) if (this.sel.has(s)) drawStroke(ctx, s);
+      this.drawContent(ctx, this.page, (o) => !this.sel.has(o), null, this.liveRedraw);
       ctx.restore();
       // Frame and handles are drawn untransformed so they keep a constant on-screen size.
       const f = this.selFrame(), c = f.corners;
@@ -1073,9 +1299,12 @@ class Editor {
   }
 
   onDown(e) {
-    if (this.selBar.contains(e.target)) return;
+    if (this.selBar.contains(e.target) || this.inTextEditor(e.target)) return;
     this.rect = this.stage.getBoundingClientRect();
-    this.root.focus({ preventScroll: true });
+    // Pencil or mouse down elsewhere finishes typing; fingers just scroll and zoom around it.
+    this.wasTyping = !!this.textEd && e.pointerType !== 'touch';
+    if (this.wasTyping) this.closeText();
+    if (!this.textEd) this.root.focus({ preventScroll: true });
     try { this.stage.setPointerCapture(e.pointerId); } catch (err) { /* synthetic pointer */ }
 
     if (e.pointerType === 'touch') {
@@ -1117,12 +1346,6 @@ class Editor {
 
   onMove(e) {
     const a = this.act;
-    if (a && !a.touch && e.pointerType !== 'touch' && e.buttons === 0 && !(e.pressure > 0)) {
-      // The pencil is hovering, so it has lifted without telling us: finish the stroke here.
-      this.penUpAt = performance.now();
-      this.endAct();
-      return;
-    }
     if (a && a.id === e.pointerId) { this.moveAct(e); return; }
     const t = this.touches.get(e.pointerId);
     if (t && this.gesture) {
@@ -1169,6 +1392,7 @@ class Editor {
   }
 
   onKey(e) {
+    if (this.inTextEditor(e.target)) return;
     const mod = e.ctrlKey || e.metaKey, k = e.key.toLowerCase();
     let done = true;
     if (mod && k === 'z') e.shiftKey ? this.redo() : this.undo();
@@ -1188,10 +1412,14 @@ class Editor {
 
   onPaste(e) {
     this.pasteSeen = true;
+    if (this.inTextEditor(e.target)) return;                // ordinary text paste into a text box
     const files = e.clipboardData ? Array.from(e.clipboardData.files || []) : [];
     const pdf = files.find((f) => f.type === 'application/pdf' || /\.pdf$/i.test(f.name || ''));
+    const pic = files.find((f) => /^image\//.test(f.type));
     e.preventDefault();
-    if (pdf) this.importPdfFile(pdf); else this.paste();
+    if (pdf) this.importPdfFile(pdf);
+    else if (pic) this.insertImageFile(pic);
+    else this.paste();
   }
 
   /* ---------------- finger gestures: pan, pinch-zoom, page swipe ---------------- */
@@ -1280,7 +1508,9 @@ class Editor {
     const [x, y] = this.toPage(e), p = this.prefs, id = e.pointerId, touch = e.pointerType === 'touch';
     let tool = p.tool;
     if (e.pointerType === 'pen' && ((e.buttons & 32) || e.button === 5)) tool = 'eraser';   // pencil eraser end / button
-    if (tool === 'eraser') {
+    if (tool === 'text') {
+      this.act = { type: 'tap', id, touch, x0: x, y0: y, moved: false, typing: this.wasTyping };
+    } else if (tool === 'eraser') {
       this.clearSelection();
       this.act = { type: 'erase', id, touch, x, y, changed: false };
       this.eraseAlong(x, y, x, y);
@@ -1325,7 +1555,8 @@ class Editor {
       for (const ev of list) { const [x, y] = this.toPage(ev); this.addPoint(a, x, y, this.pressure(ev)); }
     } else {
       const [x, y] = this.toPage(e);
-      if (a.type === 'erase') { this.eraseAlong(a.x, a.y, x, y); a.x = x; a.y = y; }
+      if (a.type === 'tap') { if (Math.hypot(x - a.x0, y - a.y0) > 8 / this.scale) a.moved = true; }
+      else if (a.type === 'erase') { this.eraseAlong(a.x, a.y, x, y); a.x = x; a.y = y; }
       else if (a.type === 'lasso') a.pts.push(x, y);
       else if (a.type === 'move') this.selM = [1, 0, 0, 1, x - a.x0, y - a.y0];
       else if (a.type === 'scale') {
@@ -1402,7 +1633,9 @@ class Editor {
       this.clearLive(); this.changed();
       return;
     }
-    if (a.type === 'erase') {
+    if (a.type === 'tap') {
+      if (!a.moved && !a.typing) this.textAt(a.x0, a.y0);
+    } else if (a.type === 'erase') {
       if (a.changed) this.changed();
     } else if (a.type === 'lasso') {
       const poly = a.pts;
@@ -1415,7 +1648,11 @@ class Editor {
           for (let i = 0; i < s.p.length; i += 3) if (inPolygon(s.p[i], s.p[i + 1], poly)) inside++;
           if (inside / (s.p.length / 3) >= 0.6) set.add(s);
         }
+        for (const it of page.items || []) { const [cx, cy] = itemCenter(it); if (inPolygon(cx, cy, poly)) set.add(it); }
         if (set.size) this.select(set);
+      } else {
+        const hit = this.objectAt(poly[0], poly[1]);              // a tap selects what is under it
+        if (hit) this.select(new Set([hit]));
       }
     } else if (a.type === 'move' || a.type === 'scale' || a.type === 'rotate') {
       const M = this.selM;
@@ -1424,6 +1661,7 @@ class Editor {
         const k = Math.sqrt(Math.abs(M[0] * M[3] - M[1] * M[2]));   // resizing scales line width too
         this.pushHistory();
         this.transformSel((s) => {
+          if (!s.p) return transformItem(s, M, k);
           const q = s.p.slice();
           for (let i = 0; i < q.length; i += 3) {
             const x = q[i], y = q[i + 1];
@@ -1477,18 +1715,34 @@ class Editor {
 
   buildSelBar() {
     this.selBar.addEventListener('pointerdown', (e) => e.stopPropagation());
+    this.editBtn = this.btn(this.selBar, 'pencil-line|type', 'Edit text', () => {
+      const it = [...this.sel][0];
+      this.clearSelection(); this.openText(it);
+    });
     this.btn(this.selBar, 'copy', 'Copy', () => { this.copySel(); this.host.notice('Copied — paste on any page or notebook'); });
     this.btn(this.selBar, 'scissors', 'Cut', () => { this.copySel(); this.deleteSel(); });
-    this.btn(this.selBar, 'copy-plus|files', 'Duplicate', () => this.pasteStrokes(this.selStrokes(), 14, 14));
+    this.btn(this.selBar, 'copy-plus|files', 'Duplicate', () => this.pasteStrokes(this.selObjects(), 14, 14));
     this.btn(this.selBar, 'trash-2|trash', 'Delete', () => this.deleteSel());
   }
 
-  selStrokes() { return this.page.strokes.filter((s) => this.sel.has(s)); }
+  selObjects() {
+    const pick = (o) => this.sel.has(o);
+    return (this.page.items || []).filter(pick).concat(this.page.strokes.filter(pick));
+  }
+
+  /* What a lasso tap at (x, y) selects, top layer first: ink, then text, then pictures. */
+  objectAt(x, y) {
+    const items = this.page.items || [], strokes = this.page.strokes, m = 6 / this.scale;
+    for (let i = strokes.length - 1; i >= 0; i--) if (strokeNear(strokes[i], x, y, m)) return strokes[i];
+    for (let i = items.length - 1; i >= 0; i--) if (items[i].k === 'text' && itemHit(items[i], x, y, m)) return items[i];
+    for (let i = items.length - 1; i >= 0; i--) if (items[i].k === 'img' && itemHit(items[i], x, y, 0)) return items[i];
+    return null;
+  }
 
   computeSelBox() {
     let b = null;
     for (const s of this.sel) {
-      const q = strokeBox(s);
+      const q = boxOf(s);
       b = b ? { x0: Math.min(b.x0, q.x0), y0: Math.min(b.y0, q.y0), x1: Math.max(b.x1, q.x1), y1: Math.max(b.y1, q.y1) } : Object.assign({}, q);
     }
     this.selBox = b;
@@ -1539,11 +1793,12 @@ class Editor {
   }
 
   transformSel(fn) {
-    const next = new Set();
-    this.page.strokes = this.page.strokes.map((s) => {
-      if (!this.sel.has(s)) return s;
-      const n = fn(s); next.add(n); return n;
-    });
+    const next = new Set(), map = (o) => {
+      if (!this.sel.has(o)) return o;
+      const n = fn(o); next.add(n); return n;
+    };
+    this.page.strokes = this.page.strokes.map(map);
+    if (this.page.items) this.page.items = this.page.items.map(map);
     this.sel = next;
     this.computeSelBox();
   }
@@ -1553,6 +1808,8 @@ class Editor {
     const busy = this.act && (this.act.type === 'move' || this.act.type === 'scale' || this.act.type === 'rotate');
     if (!b || !this.sel.size || busy) { bar.style.display = 'none'; return; }
     bar.style.display = 'flex';
+    const one = this.sel.size === 1 ? [...this.sel][0] : null;
+    this.editBtn.style.display = one && one.k === 'text' ? '' : 'none';
     const cw = this.stage.clientWidth, ch = this.stage.clientHeight, bw = bar.offsetWidth || 150, bh = bar.offsetHeight || 40;
     const x = this.tx + ((b.x0 + b.x1) / 2) * this.scale - bw / 2;
     // Below the selection (the rotate handle sits above it); above if there is no room below.
@@ -1563,7 +1820,7 @@ class Editor {
   }
 
   copySel() {
-    this.host.setClipboard(this.selStrokes().map((s) => Object.assign({}, s, { p: s.p.slice() })));
+    this.host.setClipboard(this.selObjects().map((s) => Object.assign({}, s, s.p ? { p: s.p.slice() } : {})));
     this.refreshState();
   }
 
@@ -1571,6 +1828,7 @@ class Editor {
     if (!this.sel.size) return;
     this.pushHistory();
     this.page.strokes = this.page.strokes.filter((s) => !this.sel.has(s));
+    if (this.page.items) this.page.items = this.page.items.filter((s) => !this.sel.has(s));
     this.dropSelection();
     this.renderMain(); this.queueLive(); this.changed();
   }
@@ -1580,22 +1838,28 @@ class Editor {
     if (!clip || !clip.length) return;
     // Drop the copy in the middle of what is currently visible.
     let b = null;
-    for (const s of clip) { const q = strokeBox(s); b = b ? { x0: Math.min(b.x0, q.x0), y0: Math.min(b.y0, q.y0), x1: Math.max(b.x1, q.x1), y1: Math.max(b.y1, q.y1) } : Object.assign({}, q); }
+    for (const s of clip) { const q = boxOf(s); b = b ? { x0: Math.min(b.x0, q.x0), y0: Math.min(b.y0, q.y0), x1: Math.max(b.x1, q.x1), y1: Math.max(b.y1, q.y1) } : Object.assign({}, q); }
     const vx = clamp((this.stage.clientWidth / 2 - this.tx) / this.scale, 0, this.nb.w);
     const vy = clamp((this.stage.clientHeight / 2 - this.ty) / this.scale, 0, this.nb.h);
     this.pasteStrokes(clip, vx - (b.x0 + b.x1) / 2, vy - (b.y0 + b.y1) / 2);
   }
 
-  pasteStrokes(strokes, dx, dy) {
-    if (!strokes.length) return;
-    const copies = strokes.map((s) => {
+  /* Pastes strokes and items (text, pictures), shifted by dx, dy, and selects them. */
+  pasteStrokes(objs, dx, dy) {
+    if (!objs.length) return;
+    this.closeText();
+    const copies = objs.map((s) => {
+      if (!s.p) return Object.assign({}, s, { x: r2(s.x + dx), y: r2(s.y + dy) });
       const q = s.p.slice();
       for (let i = 0; i < q.length; i += 3) { q[i] = r2(q[i] + dx); q[i + 1] = r2(q[i + 1] + dy); }
       return Object.assign({}, s, { p: q });
     });
     this.pushHistory();
     this.sel = new Set();
-    this.page.strokes.push(...copies);
+    const page = this.page;
+    page.strokes = page.strokes.concat(copies.filter((c) => c.p));
+    const items = copies.filter((c) => !c.p);
+    if (items.length) page.items = (page.items || []).concat(items);
     if (this.prefs.tool !== 'lasso') { this.prefs.tool = 'lasso'; this.host.savePrefs(); this.refreshToolbar(); }
     this.select(new Set(copies));
     this.changed();
@@ -1603,8 +1867,17 @@ class Editor {
 
   /* ---------------- history ---------------- */
 
-  pushHistory() {
-    this.undoStack.push({ page: this.page, strokes: this.page.strokes.slice() });
+  /* Undo entries are snapshots: { page, strokes, items } for what is on one page, or { pages, focus }
+     for the list of pages (adding, deleting, moving, importing). Strokes and items are never changed
+     in place, so a snapshot is just a copy of the arrays. */
+  pushHistory(page = this.page) {
+    this.record({ page, strokes: page.strokes.slice(), items: page.items ? page.items.slice() : null });
+  }
+
+  pushPages(focus = this.page) { this.record({ pages: this.nb.pages.slice(), focus }); }
+
+  record(h) {
+    this.undoStack.push(h);
     if (this.undoStack.length > 100) this.undoStack.shift();
     this.redoStack = [];
   }
@@ -1614,18 +1887,35 @@ class Editor {
 
   stepHistory(from, to) {
     if (this.act) return;
+    this.closeText();
     let h;
     while ((h = from.pop())) {
+      if (h.pages) {
+        to.push({ pages: this.nb.pages.slice(), focus: this.page });
+        this.nb.pages = h.pages.slice();
+        const i = this.nb.pages.indexOf(h.focus);
+        this.showPage(i >= 0 ? i : Math.min(this.pageIndex, this.nb.pages.length - 1), true);
+        this.changed();
+        return;
+      }
       const i = this.nb.pages.indexOf(h.page);
       if (i < 0) continue;                                 // page was deleted since
-      to.push({ page: h.page, strokes: h.page.strokes.slice() });
+      to.push({ page: h.page, strokes: h.page.strokes.slice(), items: h.page.items ? h.page.items.slice() : null });
       h.page.strokes = h.strokes;
-      this.dropSelection();
-      if (i !== this.pageIndex) this.goTo(i); else { this.renderMain(); this.paintLive(); }
+      if (h.items) h.page.items = h.items; else delete h.page.items;
+      this.showPage(i);
       this.changed();
       return;
     }
     this.refreshState();
+  }
+
+  showPage(i, force) {
+    this.dropSelection();
+    if (i !== this.pageIndex) this.goTo(i);
+    else if (force) { this.render(); this.clearLive(); }
+    else { this.renderMain(); this.paintLive(); }
+    if (this.ov) this.buildOverview();
   }
 
   changed() {
@@ -1637,6 +1927,7 @@ class Editor {
 
   goTo(i, dir) {
     if (i < 0 || i >= this.nb.pages.length || this.act) return;
+    this.closeText();
     this.dropSelection();
     this.pageIndex = i;
     this.ty = 12; this.clampPan();
@@ -1650,6 +1941,7 @@ class Editor {
   }
 
   addPage() {
+    this.pushPages();
     this.nb.pages.splice(this.pageIndex + 1, 0, { id: uid(), tpl: this.page.tpl, strokes: [] });
     this.goTo(this.pageIndex + 1, 1);
     this.changed();
@@ -1662,14 +1954,16 @@ class Editor {
     this.dropSelection(); this.renderMain(); this.clearLive(); this.changed();
   }
 
-  async deletePage() {
-    if (this.page.strokes.length && !(await this.host.confirm(`Delete page ${this.pageIndex + 1}? This cannot be undone.`))) return;
+  deletePage() {
+    this.closeText();
+    this.pushPages();
     const pages = this.nb.pages, tpl = this.page.tpl;
     pages.splice(this.pageIndex, 1);
     if (!pages.length) pages.push({ id: uid(), tpl, strokes: [] });
     this.dropSelection();
     this.pageIndex = Math.min(this.pageIndex, pages.length - 1);
-    this.renderMain(); this.clearLive(); this.changed();
+    this.render(); this.clearLive(); this.changed();
+    this.host.notice('Page deleted — Undo brings it back');
   }
 
   /* ---------------- imported PDF pages ---------------- */
@@ -1796,6 +2090,7 @@ class Editor {
       const add = [];
       for (let i = 1; i <= n; i++) add.push({ id: uid(), tpl: 'blank', strokes: [], bg: { src, n: i } });
       const at = fresh ? 0 : this.pageIndex + 1;
+      this.pushPages();
       pages.splice(at, fresh ? 1 : 0, ...add);
       this.closeOverview();
       this.goTo(at, 1);
@@ -1809,7 +2104,9 @@ class Editor {
 
   async importPdfFile(file) {
     try {
-      const src = await this.host.storePdf(file.name || 'Pasted.pdf', await file.arrayBuffer());
+      let name = file.name || 'Pasted.pdf';
+      if (!/\.pdf$/i.test(name)) name += '.pdf';
+      const src = await this.host.storeFile(name, await file.arrayBuffer());
       await this.importPdf(src);
     } catch (e) { console.error(e); this.host.notice('PDF import failed: ' + e.message); }
   }
@@ -1832,6 +2129,7 @@ class Editor {
 
   openOverview(selecting) {
     this.closeOverview();
+    this.closeText();
     this.clearSelection();
     const root = el('div', 'inkbook-overview', this.root);
     const head = el('div', 'inkbook-ovhead', root);
@@ -1843,11 +2141,14 @@ class Editor {
       grid: el('div', 'inkbook-ovgrid', root),
       io: null,
     };
+    // While a page is being dragged the grid must not scroll under the finger.
+    this.ov.grid.addEventListener('touchmove', (e) => { if (this.ov && this.ov.drag && e.cancelable) e.preventDefault(); }, { passive: false });
     this.buildOverview();
   }
 
   closeOverview() {
     if (!this.ov) return;
+    if (this.ov.drag) { cancelAnimationFrame(this.ov.drag.raf); this.ov.drag = null; }
     if (this.ov.io) this.ov.io.disconnect();
     this.ov.el.remove();
     this.ov = null;
@@ -1875,6 +2176,10 @@ class Editor {
       this.ovButton('Cancel', () => { ov.selecting = false; ov.picked.clear(); this.buildOverview(); });
     } else {
       ov.title.textContent = `${n} page${n === 1 ? '' : 's'}`;
+      ov.title.title = 'Hold a page and drag it to move it';
+      el('span', 'inkbook-ovhint', ov.title).textContent = n > 1 ? ' · hold a page to move it' : '';
+      const u = this.ovButton('Undo', () => this.undo());
+      u.disabled = !this.undoStack.length;
       this.ovButton('Select', () => { ov.selecting = true; this.buildOverview(); });
       this.ovButton('Done', () => this.closeOverview(), 'mod-cta');
     }
@@ -1898,8 +2203,11 @@ class Editor {
       el('div', 'inkbook-tilenum', tile).textContent = String(i + 1);
       if (ov.selecting) el('div', 'inkbook-check', tile);
       tile._draw = () => this.drawThumb(c, page);
+      tile._page = page;
       if (ov.io) ov.io.observe(tile); else tile._draw();
+      tile.addEventListener('pointerdown', (e) => this.ovPress(e, tile));
       tile.addEventListener('click', () => {
+        if (tile._noClick) return;
         if (ov.selecting) {
           if (ov.picked.has(i)) ov.picked.delete(i); else ov.picked.add(i);
           tile.classList.toggle('is-picked', ov.picked.has(i));
@@ -1916,11 +2224,96 @@ class Editor {
       add.style.aspectRatio = `${nb.w} / ${nb.h}`;
       add.setAttribute('aria-label', 'Add page at the end');
       add.addEventListener('click', () => {
+        this.pushPages();
         nb.pages.push({ id: uid(), tpl: nb.pages[nb.pages.length - 1].tpl, strokes: [] });
         this.changed(); this.buildOverview();
         ov.grid.scrollTop = ov.grid.scrollHeight;
       });
     }
+  }
+
+  /* Hold a page (or drag it with the mouse) to pick it up; the other pages make room as it moves. */
+  ovPress(e, tile) {
+    const ov = this.ov;
+    if (!ov || ov.selecting || ov.drag || (e.pointerType === 'mouse' && e.button !== 0)) return;
+    const mouse = e.pointerType === 'mouse';
+    const st = { id: e.pointerId, x: e.clientX, y: e.clientY, lx: e.clientX, ly: e.clientY, tile, on: false, timer: 0, raf: 0 };
+    const off = () => {
+      clearTimeout(st.timer);
+      window.removeEventListener('pointermove', move, true);
+      window.removeEventListener('pointerup', up, true);
+      window.removeEventListener('pointercancel', up, true);
+    };
+    const move = (ev) => {
+      if (ev.pointerId !== st.id) return;
+      st.lx = ev.clientX; st.ly = ev.clientY;
+      if (st.on) { ev.preventDefault(); return; }
+      const d = Math.hypot(ev.clientX - st.x, ev.clientY - st.y);
+      if (mouse && d > 6) this.ovDragStart(st);
+      else if (!mouse && d > 10) off();                    // moved before the hold: a scroll
+    };
+    const up = (ev) => {
+      if (ev.pointerId !== st.id) return;
+      off();
+      if (st.on) this.ovDragEnd(st);
+    };
+    if (!mouse) st.timer = setTimeout(() => this.ovDragStart(st), 380);
+    window.addEventListener('pointermove', move, true);
+    window.addEventListener('pointerup', up, true);
+    window.addEventListener('pointercancel', up, true);
+  }
+
+  ovDragStart(st) {
+    const ov = this.ov;
+    if (!ov || st.on || !st.tile.isConnected) return;
+    st.on = true; ov.drag = st;
+    const r = st.tile.getBoundingClientRect();
+    st.dx = st.lx - r.left; st.dy = st.ly - r.top;
+    st.ghost = el('div', 'inkbook-dragghost', ov.el);
+    st.ghost.style.width = r.width + 'px';
+    const src = st.tile.querySelector('canvas'), c = el('canvas', 'inkbook-thumb', st.ghost);
+    c.width = src.width; c.height = src.height; c.style.aspectRatio = src.style.aspectRatio;
+    if (src.width) c.getContext('2d').drawImage(src, 0, 0);
+    st.tile.classList.add('is-dragging');
+    if (navigator.vibrate) try { navigator.vibrate(10); } catch (e) { /* not supported */ }
+    this.ovDragFrame();
+  }
+
+  ovDragFrame() {
+    const ov = this.ov, st = ov && ov.drag;
+    if (!st) return;
+    const or = ov.el.getBoundingClientRect(), g = ov.grid, gr = g.getBoundingClientRect(), edge = 60;
+    st.ghost.style.transform = `translate(${st.lx - st.dx - or.left}px, ${st.ly - st.dy - or.top}px)`;
+    if (st.ly < gr.top + edge) g.scrollTop -= Math.ceil((gr.top + edge - st.ly) / 4);           // scroll near the edges
+    else if (st.ly > gr.bottom - edge) g.scrollTop += Math.ceil((st.ly - gr.bottom + edge) / 4);
+    for (const t of g.children) {
+      if (!t._page || t === st.tile) continue;
+      const r = t.getBoundingClientRect();
+      if (st.lx < r.left || st.lx > r.right || st.ly < r.top || st.ly > r.bottom) continue;
+      // Take the place of the page under the finger: it shifts one step towards where we came from.
+      const before = st.tile.compareDocumentPosition(t) & Node.DOCUMENT_POSITION_FOLLOWING;
+      g.insertBefore(st.tile, before ? t.nextSibling : t);
+      break;
+    }
+    st.raf = requestAnimationFrame(() => this.ovDragFrame());
+  }
+
+  ovDragEnd(st) {
+    cancelAnimationFrame(st.raf);
+    const ov = this.ov;
+    if (!ov || ov.drag !== st) return;
+    ov.drag = null;
+    st.ghost.remove(); st.tile.classList.remove('is-dragging');
+    st.tile._noClick = true;
+    setTimeout(() => { st.tile._noClick = false; }, 400);
+    const order = [...ov.grid.children].filter((t) => t._page).map((t) => t._page);
+    if (order.length !== this.nb.pages.length || order.every((p, i) => p === this.nb.pages[i])) return;
+    const cur = this.page;
+    this.pushPages();
+    this.nb.pages = order;
+    this.pageIndex = order.indexOf(cur);
+    this.changed();
+    this.buildOverview();
   }
 
   drawThumb(c, page) {
@@ -1933,20 +2326,180 @@ class Editor {
       const r = this.bgCached(this.bgThumb, page.bg, k, 400, () => { if (c.isConnected) this.drawThumb(c, page); });
       if (r && r.canvas) ctx.drawImage(r.canvas, r.fit.x, r.fit.y, r.fit.w, r.fit.h);
     }
-    for (const s of page.strokes) drawStroke(ctx, s);
+    this.drawContent(ctx, page, null, null, () => { if (c.isConnected) this.drawThumb(c, page); });
   }
 
-  async deletePages(list) {
+  deletePages(list) {
     if (!list.length) return;
     const pages = this.nb.pages, n = list.length;
-    if (!(await this.host.confirm(`Delete ${n} page${n === 1 ? '' : 's'}? This cannot be undone.`))) return;
     const drop = new Set(list.map((i) => pages[i])), tpl = this.page.tpl, cur = this.page;
+    this.pushPages();
     this.nb.pages = pages.filter((p) => !drop.has(p));
     if (!this.nb.pages.length) this.nb.pages.push({ id: uid(), tpl, strokes: [] });
     const keep = this.nb.pages.indexOf(cur);
     this.pageIndex = keep >= 0 ? keep : Math.min(this.pageIndex, this.nb.pages.length - 1);
     this.dropSelection(); this.render(); this.clearLive(); this.changed();
     if (this.ov) { this.ov.picked.clear(); this.ov.selecting = false; this.buildOverview(); }
+    this.host.notice(`Deleted ${n} page${n === 1 ? '' : 's'} — Undo brings ${n === 1 ? 'it' : 'them'} back`);
+  }
+
+  /* ---------------- text boxes ---------------- */
+
+  inTextEditor(t) { return !!this.textEd && this.textEd.ta === t; }
+
+  /* Text tool tap: edit the text box under the pencil, or start a new one there. */
+  textAt(x, y) {
+    const items = this.page.items || [];
+    for (let i = items.length - 1; i >= 0; i--) {
+      if (items[i].k === 'text' && itemHit(items[i], x, y, 4 / this.scale)) { this.openText(items[i]); return; }
+    }
+    const p = this.prefs, size = p.textSize, nb = this.nb, x0 = clamp(x, 4, nb.w - 64);
+    this.openText({ k: 'text', x: r2(x0 - TEXT_PAD), y: r2(y - size * 0.8 - TEXT_PAD), w: r2(clamp(nb.w - x0 - 16, 60, 320)), size, c: p.penColor, text: '', rot: 0 });
+  }
+
+  openText(orig) {
+    this.closeText();
+    this.clearSelection();
+    const ta = el('textarea', 'inkbook-textedit', this.stage);
+    ta.value = orig.text;
+    ta.setAttribute('aria-label', 'Text box');
+    this.textEd = { ta, orig, item: orig, page: this.page };
+    ta.addEventListener('input', () => this.placeText());
+    ta.addEventListener('keydown', (e) => {
+      e.stopPropagation();
+      if (e.key === 'Escape' || (e.key === 'Enter' && (e.metaKey || e.ctrlKey))) { e.preventDefault(); this.closeText(); }
+    });
+    // Hiding the keyboard (or tapping outside the notebook) finishes the text box.
+    ta.addEventListener('blur', () => setTimeout(() => {
+      if (this.textEd && this.textEd.ta === ta && document.activeElement !== ta) this.closeText();
+    }, 150));
+    this.placeText();
+    this.renderMain();
+    ta.focus({ preventScroll: true });
+    try { ta.setSelectionRange(ta.value.length, ta.value.length); } catch (e) { /* not focusable yet */ }
+  }
+
+  placeText() {
+    const t = this.textEd;
+    if (!t) return;
+    const it = t.item, s = this.scale, ta = t.ta;
+    ta.style.left = this.tx + it.x * s + 'px';
+    ta.style.top = this.ty + it.y * s + 'px';
+    ta.style.width = it.w * s + 'px';
+    ta.style.fontSize = it.size * s + 'px';
+    ta.style.padding = TEXT_PAD * s + 'px';
+    ta.style.color = it.c;
+    ta.style.transform = it.rot ? `rotate(${it.rot}rad)` : '';
+    ta.style.height = '0px';
+    ta.style.height = Math.max(ta.scrollHeight, (2 * TEXT_PAD + it.size * TEXT_LH) * s) + 'px';
+  }
+
+  /* Colour / size changes while typing apply to the text box. */
+  restyleText(props) {
+    const t = this.textEd;
+    if (!t) return;
+    t.item = Object.assign({}, t.item, props);
+    this.placeText();
+    t.ta.focus({ preventScroll: true });
+  }
+
+  /* Puts the typed text on the page (an emptied box is removed). silent: just close. */
+  closeText(silent) {
+    const t = this.textEd;
+    if (!t) return;
+    this.textEd = null;
+    const text = t.ta.value.replace(/\s+$/, '');
+    t.ta.remove();
+    if (silent) return;
+    const page = t.page, items = page.items || [], i = items.indexOf(t.orig);
+    const next = text ? Object.assign({}, t.item, { text }) : null;
+    const same = i >= 0 && next && next.text === t.orig.text && next.c === t.orig.c && next.size === t.orig.size;
+    if (!same && (i >= 0 || next)) {
+      this.pushHistory(page);
+      const out = items.slice();
+      if (i < 0) out.push(next); else if (next) out[i] = next; else out.splice(i, 1);
+      page.items = out;
+      this.changed();
+    }
+    if (page === this.page) this.renderMain();
+  }
+
+  /* ---------------- pictures ---------------- */
+
+  /* Decoded picture for a vault path (null while it loads; onReady runs once it has). */
+  image(src, onReady) {
+    let e = this.imgs.get(src);
+    if (!e) {
+      e = { img: null, failed: false, url: null, waiters: new Set() };
+      this.imgs.set(src, e);
+      Promise.resolve().then(() => this.host.readFile(src)).then((buf) => new Promise((res, rej) => {
+        e.url = URL.createObjectURL(new Blob([buf], { type: MIME[src.split('.').pop().toLowerCase()] || '' }));
+        const im = new Image();
+        im.onload = () => res(im);
+        im.onerror = () => rej(new Error('cannot read ' + src));
+        im.src = e.url;
+      })).then((im) => { e.img = im; }, (err) => {
+        console.error(err);
+        e.failed = true;
+        if (!this.imgWarned) { this.imgWarned = true; this.host.notice('Picture missing: ' + src); }
+      }).then(() => {
+        const w = [...e.waiters];
+        e.waiters.clear();
+        for (const f of w) f();
+      });
+    }
+    if (!e.img && !e.failed && onReady) e.waiters.add(onReady);
+    return e.img;
+  }
+
+  loadImage(src) {
+    return new Promise((res) => {
+      const im = this.image(src, () => res(this.imgs.get(src).img));
+      if (im || this.imgs.get(src).failed) res(im);
+    });
+  }
+
+  pickDeviceImage() {
+    const inp = document.createElement('input');
+    inp.type = 'file'; inp.accept = 'image/*';
+    inp.style.display = 'none';
+    document.body.appendChild(inp);
+    inp.addEventListener('change', () => { if (inp.files && inp.files[0]) this.insertImageFile(inp.files[0]); inp.remove(); });
+    inp.click();
+  }
+
+  async pickVaultImage() {
+    const src = await this.host.pickImage();
+    if (src) this.insertImage(src);
+  }
+
+  /* Photos are shrunk to at most MAX_PIC pixels across before they are saved into the vault. */
+  async insertImageFile(file) {
+    try {
+      const pic = await shrinkImage(file);
+      const src = await this.host.storeFile(pic.name, pic.buffer);
+      await this.insertImage(src, pic.w, pic.h);
+    } catch (e) { console.error(e); this.host.notice('Could not insert the picture: ' + e.message); }
+  }
+
+  async insertImage(src, w, h) {
+    if (!w) {
+      const im = await this.loadImage(src);
+      if (!im) return;
+      w = im.naturalWidth; h = im.naturalHeight;
+    }
+    const nb = this.nb, k = Math.min(0.75, (nb.w * 0.6) / w, (nb.h * 0.45) / h);   // 0.75: 96 dpi pixels to points
+    const iw = r2(w * k), ih = r2(h * k);
+    const cx = clamp((this.stage.clientWidth / 2 - this.tx) / this.scale, iw / 2, nb.w - iw / 2);
+    const cy = clamp((this.stage.clientHeight / 2 - this.ty) / this.scale, ih / 2, nb.h - ih / 2);
+    const it = { k: 'img', x: r2(cx - iw / 2), y: r2(cy - ih / 2), w: iw, h: ih, src, rot: 0 };
+    this.closeText();
+    this.pushHistory();
+    this.page.items = (this.page.items || []).concat([it]);
+    // Selected straight away, so it can be moved, resized or turned.
+    if (this.prefs.tool !== 'lasso') { this.prefs.tool = 'lasso'; this.host.savePrefs(); this.refreshToolbar(); }
+    this.select(new Set([it]));
+    this.changed();
   }
 
   /* ---------------- export ---------------- */
@@ -1965,7 +2518,15 @@ class Editor {
         images.set(i, { bytes: new Uint8Array(await blob.arrayBuffer()), w: r.canvas.width, h: r.canvas.height, fit: r.fit });
         r.canvas.width = 0;
       }
-      const bytes = await buildPdf(nb, list, images);
+      const pics = new Map();
+      for (const i of list) {
+        for (const it of nb.pages[i].items || []) {
+          if (it.k !== 'img' || pics.has(it.src)) continue;
+          const im = await this.loadImage(it.src);
+          if (im) pics.set(it.src, await jpegOf(im));
+        }
+      }
+      const bytes = await buildPdf(nb, list, images, pics);
       const all = list.length === nb.pages.length;
       await this.host.saveFile(all ? '.pdf' : ` - pages ${pageRanges(list)}.pdf`, bytes.buffer, 'application/pdf');
     } catch (e) { console.error(e); this.host.notice('PDF export failed: ' + e.message); }
@@ -1983,11 +2544,62 @@ class Editor {
         ctx.drawImage(r.canvas, r.fit.x, r.fit.y, r.fit.w, r.fit.h);
         r.canvas.width = 0;
       }
-      for (const s of page.strokes) drawStroke(ctx, s);
+      for (const it of page.items || []) if (it.k === 'img') await this.loadImage(it.src);
+      this.drawContent(ctx, page);
       const blob = await new Promise((res) => c.toBlob(res, 'image/png'));
       await this.host.saveFile(` - page ${this.pageIndex + 1}.png`, await blob.arrayBuffer(), 'image/png');
     } catch (e) { console.error(e); this.host.notice('PNG export failed: ' + e.message); }
   }
+}
+
+function decodeImage(url) {
+  return new Promise((res, rej) => {
+    const im = new Image();
+    im.onload = () => res(im);
+    im.onerror = () => rej(new Error('this file is not a picture that can be opened here'));
+    im.src = url;
+  });
+}
+
+function canvasJpeg(c, q) {
+  return new Promise((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error('could not compress the picture'))), 'image/jpeg', q));
+}
+
+/* Small PNG / JPEG / GIF files are kept as they are; anything big (camera photos) is scaled down to
+   MAX_PIC pixels and saved as JPEG — usually 200–500 KB instead of several MB. */
+async function shrinkImage(file) {
+  const base = (file.name || 'Picture').replace(/\.[^.]*$/, '') || 'Picture';
+  const url = URL.createObjectURL(file);
+  try {
+    const im = await decodeImage(url), W = im.naturalWidth, H = im.naturalHeight;
+    if (!W || !H) throw new Error('the picture is empty');
+    const k = Math.min(1, MAX_PIC / Math.max(W, H)), type = file.type || '';
+    const small = { 'image/png': 1.5e6, 'image/jpeg': 1e6, 'image/gif': 1e6 }[type];
+    if (k === 1 && small && file.size < small) {
+      return { name: base + '.' + ({ 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif' })[type], buffer: await file.arrayBuffer(), w: W, h: H };
+    }
+    const c = document.createElement('canvas');
+    c.width = Math.max(1, Math.round(W * k)); c.height = Math.max(1, Math.round(H * k));
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+    ctx.drawImage(im, 0, 0, c.width, c.height);
+    const blob = await canvasJpeg(c, 0.85), out = { name: base + '.jpg', buffer: await blob.arrayBuffer(), w: c.width, h: c.height };
+    c.width = 0;
+    return out;
+  } finally { URL.revokeObjectURL(url); }
+}
+
+/* A decoded picture as JPEG bytes for the PDF (transparent parts become white). */
+async function jpegOf(im) {
+  const W = im.naturalWidth, H = im.naturalHeight, k = Math.min(1, MAX_PIC / Math.max(W, H, 1));
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(W * k)); c.height = Math.max(1, Math.round(H * k));
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+  ctx.drawImage(im, 0, 0, c.width, c.height);
+  const out = { bytes: new Uint8Array(await (await canvasJpeg(c, 0.9)).arrayBuffer()), w: c.width, h: c.height };
+  c.width = 0;
+  return out;
 }
 
 /* [0,1,2,4,6,7] -> "1-3, 5, 7-8" */
@@ -2042,9 +2654,9 @@ class NewNotebookModal extends obsidian.Modal {
   onClose() { this.contentEl.empty(); }
 }
 
-class PdfPickModal extends obsidian.FuzzySuggestModal {
-  constructor(app, done) { super(app); this.done = done; this.setPlaceholder('Choose a PDF to add to this notebook'); }
-  getItems() { return this.app.vault.getFiles().filter((f) => f.extension.toLowerCase() === 'pdf'); }
+class FilePickModal extends obsidian.FuzzySuggestModal {
+  constructor(app, exts, placeholder, done) { super(app); this.exts = exts; this.done = done; this.setPlaceholder(placeholder); }
+  getItems() { return this.app.vault.getFiles().filter((f) => this.exts.includes(f.extension.toLowerCase())); }
   getItemText(f) { return f.path; }
   onChooseItem(f) { this.done(f.path); }
   // Obsidian closes the modal before reporting the choice, so report "nothing chosen" a moment later.
@@ -2092,6 +2704,10 @@ class InkbookView extends obsidian.TextFileView {
 
   makeHost() {
     const plugin = this.plugin, view = this, app = plugin.app;
+    const pick = (exts, placeholder) => new Promise((res) => {
+      let settled = false;
+      new FilePickModal(app, exts, placeholder, (p) => { if (!settled) { settled = true; res(p); } }).open();
+    });
     return {
       prefs: plugin.settings,
       savePrefs: () => plugin.saveSettingsSoon(),
@@ -2114,6 +2730,11 @@ class InkbookView extends obsidian.TextFileView {
       notice: (t) => new obsidian.Notice(t),
       confirm: (t) => new Promise((res) => new ConfirmModal(app, t, res).open()),
       // PDF pages behind the ink are rendered with the pdf.js copy that ships inside Obsidian.
+      readFile: async (src) => {
+        const f = app.vault.getAbstractFileByPath(src);
+        if (!(f instanceof obsidian.TFile)) throw new Error('file not found: ' + src);
+        return app.vault.readBinary(f);
+      },
       loadPdf: async (src) => {
         const f = app.vault.getAbstractFileByPath(src);
         if (!(f instanceof obsidian.TFile)) throw new Error('file not found: ' + src);
@@ -2121,23 +2742,20 @@ class InkbookView extends obsidian.TextFileView {
         const data = new Uint8Array(await app.vault.readBinary(f));
         return lib.getDocument({ data }).promise;
       },
-      pickPdf: () => new Promise((res) => {
-        let settled = false;
-        new PdfPickModal(app, (p) => { if (!settled) { settled = true; res(p); } }).open();
-      }),
-      // PDFs from the device or the clipboard are saved into the vault (attachment folder) first.
-      storePdf: async (name, buffer) => {
-        name = (name || '').replace(/[\\/:*?"<>|#^[\]]/g, '').trim() || 'Imported.pdf';
-        if (!/\.pdf$/i.test(name)) name += '.pdf';
+      pickPdf: () => pick(['pdf'], 'Choose a PDF to add to this notebook'),
+      pickImage: () => pick(PIC_EXTS, 'Choose a picture to put on this page'),
+      // PDFs and pictures from the device or the clipboard are saved into the vault (attachment folder) first.
+      storeFile: async (name, buffer) => {
+        name = (name || '').replace(/[\\/:*?"<>|#^[\]]/g, '').trim() || 'Imported';
+        const dot = name.lastIndexOf('.'), base = dot > 0 ? name.slice(0, dot) : name, ext = dot > 0 ? name.slice(dot) : '';
         const from = view.file ? view.file.path : '';
         let path;
         if (app.fileManager.getAvailablePathForAttachment) {
           path = await app.fileManager.getAvailablePathForAttachment(name, from);
         } else {
           const dir = view.file && view.file.parent && view.file.parent.path !== '/' ? view.file.parent.path + '/' : '';
-          const base = name.replace(/\.pdf$/i, '');
           path = obsidian.normalizePath(dir + name);
-          for (let i = 1; app.vault.getAbstractFileByPath(path); i++) path = obsidian.normalizePath(`${dir}${base} ${i}.pdf`);
+          for (let i = 1; app.vault.getAbstractFileByPath(path); i++) path = obsidian.normalizePath(`${dir}${base} ${i}${ext}`);
         }
         const folder = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
         if (folder && !app.vault.getAbstractFileByPath(folder)) await app.vault.createFolder(folder);
