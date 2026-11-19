@@ -27,13 +27,12 @@ needed if you paste directly into `.obsidian/plugins`). With Obsidian Sync, enab
 - **Erase:** scribble back and forth over ink with the pen, or use the eraser tool. The eraser has
   two modes: **Precise** rubs out only the ink under the circle (cutting strokes in two where
   needed); **Stroke** removes every stroke it passes over.
-- **Straight lines and circles:** draw, then hold the pencil still for half a second — or use the
-  shape pen, which always corrects.
+- **Straight lines and circles:** draw, then hold the pencil still for half a second.
 - **Lasso:** circle some ink, then drag it to move, or use the popup to copy / cut / duplicate /
   delete. Tap a single stroke, text box or picture to select just that. Corner handles resize, the
   handle on top turns. Paste works on any page or in another notebook. Tapping a colour recolours
   the selection.
-- **Text boxes** (T tool): tap the page and type; tap a text box to change it. Colour and the three
+- **Text boxes** (T "Add text" tool, last of the tools): tap the page and type; tap a text box to change it. Colour and the three
   text sizes apply while typing. Tap elsewhere or hide the keyboard to finish. Move, resize or turn a
   text box with the lasso; the lasso popup also has **Edit text**.
 - **Pictures** (picture button, or paste on desktop): a photo from the camera roll / Files, or a
@@ -42,8 +41,11 @@ needed if you paste directly into `.obsidian/plugins`). With Obsidian Sync, enab
   the vault. Pictures sit under the ink, so you can write on them.
 - **Undo** also covers adding, deleting, moving and importing pages.
 - **All pages:** tap the page number (or the grid button next to it) for a thumbnail overview. Tap a
-  page to jump to it; hold a page and drag it to move it; tap **Select** to pick pages to export as a
-  PDF or delete.
+  page to jump to it; drag a page by its ⠿ handle (or hold the page) to move it; tap **Select** to
+  pick pages to export as a PDF or delete.
+- **Bookmarks:** the bookmark button next to the page number marks the current page (it turns red).
+  In All pages, bookmarked pages have a red ribbon — tap any ribbon to add or remove a bookmark —
+  and **Bookmarks** shows only those pages.
 - **Import a PDF** (⋯ menu): from the vault or from the device (Files app on iPad). Each PDF page
   becomes a notebook page you can write on. On desktop you can also paste a PDF file with Ctrl/Cmd+V.
   PDFs from the device are saved into your attachments folder; the notebook links to them, so keep
