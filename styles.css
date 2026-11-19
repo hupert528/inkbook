@@ -417,3 +417,50 @@
 .inkbook-dragghost .inkbook-thumb {
   transform: scale(1.06) rotate(-2deg);
 }
+
+/* ---------- bookmarks ---------- */
+
+.inkbook-root button.inkbook-btn.is-marked {
+  color: #dc2626;
+}
+
+.inkbook-root button.inkbook-btn.is-marked svg {
+  fill: #dc2626;
+}
+
+.inkbook-ribbon {
+  position: absolute;
+  top: -4px;
+  left: 10px;
+  width: 22px;
+  height: 30px;
+  cursor: pointer;
+  background: rgba(120, 120, 130, 0.18);
+  clip-path: polygon(0 0, 100% 0, 100% 100%, 50% 72%, 0 100%);
+}
+
+.inkbook-tile.is-marked .inkbook-ribbon {
+  background: #dc2626;
+}
+
+.inkbook-root button.inkbook-textbtn.is-on {
+  background: #dc2626;
+  color: #fff;
+}
+
+.inkbook-grip {
+  position: absolute;
+  right: 4px;
+  bottom: 30px;
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+  color: var(--text-muted, #555);
+  touch-action: none;
+  cursor: grab;
+}

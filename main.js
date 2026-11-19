@@ -134,6 +134,7 @@ function serializeNotebook(nb) {
     const o = { id: page.id, tpl: page.tpl };
     if (page.bg) o.bg = page.bg;
     if (page.items && page.items.length) { o.items = page.items; hasItems = true; }
+    if (page.mark) { o.mark = 1; hasItems = true; }
     o.ink = [];
     for (const s of page.strokes) {
       const key = s.t + '|' + s.c + '|' + s.w;
@@ -147,7 +148,7 @@ function serializeNotebook(nb) {
   });
   // The page list is called `pg`, not `pages`, so an older copy of the plugin on another device
   // refuses the file (and leaves it untouched) instead of opening it as an empty notebook.
-  // Text boxes and pictures need version 3; without them the file stays readable by version 2 plugins.
+  // Text boxes, pictures and bookmarks need version 3; without them the file stays readable by version 2 plugins.
   return JSON.stringify({ version: hasItems ? 3 : 2, w: nb.w, h: nb.h, spacing: nb.spacing, paper: nb.paper, styles, pg });
 }
 
@@ -167,6 +168,7 @@ function parseNotebook(text, prefs) {
     if (!src) continue;
     const page = { id: src.id || uid(), tpl: TEMPLATES[src.tpl] ? src.tpl : 'squared', strokes: [] };
     if (src.bg && typeof src.bg.src === 'string' && src.bg.n >= 1) page.bg = { src: src.bg.src, n: src.bg.n };   // imported PDF page
+    if (src.mark) page.mark = true;                      // bookmarked page
     if (Array.isArray(src.items)) {
       const items = src.items.map(cleanItem).filter(Boolean);
       if (items.length) page.items = items;
@@ -776,14 +778,14 @@ const TOOLS = [
   ['highlighter', 'highlighter', 'Highlighter'],
   ['eraser', 'eraser', 'Eraser'],
   ['lasso', 'lasso', 'Lasso select (tap ink, a picture or text to select it)'],
-  ['text', 'type', 'Text box'],
-  ['shape', 'shapes|circle', 'Shape pen (lines and circles)'],
+  ['text', 'type|text-cursor-input|text', 'Add text'],
 ];
 
 class Editor {
   constructor(parent, host) {
     this.host = host;
     this.prefs = host.prefs;
+    if (!TOOLS.some((t) => t[0] === this.prefs.tool)) this.prefs.tool = 'pen';   // the old shape pen
     this.nb = newNotebook(this.prefs);
     this.pageIndex = 0;
     this.scale = 1; this.tx = 0; this.ty = 0; this.ready = false;
@@ -919,6 +921,7 @@ class Editor {
     this.pageLabel = el('div', 'inkbook-pagelabel', g3);
     this.pageLabel.addEventListener('click', () => this.openOverview());
     this.nextBtn = this.btn(g3, 'chevron-right', 'Next page', () => this.goTo(this.pageIndex + 1, 1));
+    this.markBtn = this.btn(g3, 'bookmark', 'Bookmark this page', () => this.toggleMark(this.page));
     this.btn(g3, 'plus', 'Add page', () => this.addPage());
     this.btn(g3, 'layout-dashboard|layout-grid', 'All pages', () => this.openOverview());
     const g4 = el('div', 'inkbook-group', t);
@@ -1019,6 +1022,16 @@ class Editor {
     this.prevBtn.disabled = this.pageIndex === 0;
     this.nextBtn.disabled = this.pageIndex >= this.nb.pages.length - 1;
     this.pageLabel.textContent = `${this.pageIndex + 1} / ${this.nb.pages.length}`;
+    const marked = !!this.page.mark;
+    this.markBtn.classList.toggle('is-marked', marked);
+    this.markBtn.setAttribute('aria-label', marked ? 'Remove bookmark from this page' : 'Bookmark this page');
+  }
+
+  /* Bookmarks mark pages; they show as red ribbons in All pages, which can list only them. */
+  toggleMark(page) {
+    if (page.mark) delete page.mark; else page.mark = true;
+    this.changed();
+    if (page === this.page && page.mark && !this.ov) this.host.notice('Page bookmarked — All pages shows it with a red ribbon');
   }
 
   setTool(tool) {
@@ -1590,7 +1603,7 @@ class Editor {
 
   armHold(a) {
     clearTimeout(a.timer);
-    if (!this.prefs.holdSnap && a.tool !== 'shape') return;
+    if (!this.prefs.holdSnap) return;
     a.timer = setTimeout(() => {
       if (this.act !== a || a.snapped) return;
       const r = recognize(a.s.p.concat([r2(a.rx), r2(a.ry), a.sp]));
@@ -1616,7 +1629,6 @@ class Editor {
       const p = a.s.p;
       if (!a.snapped && Math.hypot(a.rx - p[p.length - 3], a.ry - p[p.length - 2]) > 0.05) p.push(r2(a.rx), r2(a.ry), r2(a.sp));
       let snapped = a.snapped;
-      if (!snapped && a.tool === 'shape') snapped = recognize(p);
       if (!snapped && a.tool === 'pen' && this.prefs.scribbleErase && isScribble(p)) {
         const hit = new Set(page.strokes.filter((s) => scribbleHits(p, s)));
         if (hit.size) {
@@ -2175,9 +2187,12 @@ class Editor {
       ex.disabled = del.disabled = !k;
       this.ovButton('Cancel', () => { ov.selecting = false; ov.picked.clear(); this.buildOverview(); });
     } else {
-      ov.title.textContent = `${n} page${n === 1 ? '' : 's'}`;
-      ov.title.title = 'Hold a page and drag it to move it';
-      el('span', 'inkbook-ovhint', ov.title).textContent = n > 1 ? ' · hold a page to move it' : '';
+      const marks = this.nb.pages.filter((p) => p.mark).length;
+      if (ov.marked && !marks) ov.marked = false;
+      ov.title.textContent = ov.marked ? `${marks} bookmarked page${marks === 1 ? '' : 's'}` : `${n} page${n === 1 ? '' : 's'}`;
+      el('span', 'inkbook-ovhint', ov.title).textContent = ov.marked ? '' : n > 1 ? ' · drag the ⠿ handle to move a page' : '';
+      const bm = this.ovButton(ov.marked ? 'Show all pages' : `Bookmarks (${marks})`, () => { ov.marked = !ov.marked; this.buildOverview(); }, ov.marked ? 'is-on' : '');
+      bm.disabled = !marks && !ov.marked;
       const u = this.ovButton('Undo', () => this.undo());
       u.disabled = !this.undoStack.length;
       this.ovButton('Select', () => { ov.selecting = true; this.buildOverview(); });
@@ -2196,16 +2211,39 @@ class Editor {
         for (const en of list) if (en.isIntersecting) { ov.io.unobserve(en.target); en.target._draw(); }
       }, { root: ov.grid, rootMargin: '300px' })
       : null;
+    const filtered = !!ov.marked && !ov.selecting;
     nb.pages.forEach((page, i) => {
-      const tile = el('div', 'inkbook-tile' + (i === this.pageIndex ? ' is-current' : '') + (ov.picked.has(i) ? ' is-picked' : ''), ov.grid);
+      if (filtered && !page.mark) return;
+      const tile = el('div', 'inkbook-tile' + (i === this.pageIndex ? ' is-current' : '') + (ov.picked.has(i) ? ' is-picked' : '') + (page.mark ? ' is-marked' : ''), ov.grid);
       const c = el('canvas', 'inkbook-thumb', tile);
       c.style.aspectRatio = `${nb.w} / ${nb.h}`;
       el('div', 'inkbook-tilenum', tile).textContent = String(i + 1);
       if (ov.selecting) el('div', 'inkbook-check', tile);
+      else {
+        // Bookmark ribbon: red when the page is bookmarked; tap it to add or remove the bookmark.
+        const rib = el('div', 'inkbook-ribbon', tile);
+        rib.setAttribute('role', 'button');
+        rib.setAttribute('aria-label', page.mark ? 'Remove bookmark' : 'Bookmark this page');
+        rib.addEventListener('pointerdown', (e) => e.stopPropagation());
+        rib.addEventListener('click', (e) => {
+          e.stopPropagation();
+          this.toggleMark(page);
+          if (filtered) this.buildOverview();
+          else { tile.classList.toggle('is-marked', !!page.mark); this.refreshOverviewHead(); }
+        });
+        if (!filtered && nb.pages.length > 1) {
+          // Drag handle: pressing it picks the page up at once (no hold needed) and never scrolls.
+          const grip = el('div', 'inkbook-grip', tile);
+          grip.setAttribute('aria-label', 'Drag to move this page');
+          this.host.setIcon(grip, 'grip-vertical|grip|move');
+          grip.addEventListener('touchstart', (e) => { if (e.cancelable) e.preventDefault(); }, { passive: false });
+          grip.addEventListener('pointerdown', (e) => { e.stopPropagation(); e.preventDefault(); this.ovPress(e, tile, true); });
+        }
+      }
       tile._draw = () => this.drawThumb(c, page);
       tile._page = page;
       if (ov.io) ov.io.observe(tile); else tile._draw();
-      tile.addEventListener('pointerdown', (e) => this.ovPress(e, tile));
+      if (!filtered) tile.addEventListener('pointerdown', (e) => this.ovPress(e, tile));
       tile.addEventListener('click', () => {
         if (tile._noClick) return;
         if (ov.selecting) {
@@ -2218,7 +2256,7 @@ class Editor {
         }
       });
     });
-    if (!ov.selecting) {
+    if (!ov.selecting && !filtered) {
       const add = el('div', 'inkbook-tile inkbook-addtile', ov.grid);
       add.textContent = '+';
       add.style.aspectRatio = `${nb.w} / ${nb.h}`;
@@ -2233,7 +2271,7 @@ class Editor {
   }
 
   /* Hold a page (or drag it with the mouse) to pick it up; the other pages make room as it moves. */
-  ovPress(e, tile) {
+  ovPress(e, tile, now) {
     const ov = this.ov;
     if (!ov || ov.selecting || ov.drag || (e.pointerType === 'mouse' && e.button !== 0)) return;
     const mouse = e.pointerType === 'mouse';
@@ -2257,10 +2295,11 @@ class Editor {
       off();
       if (st.on) this.ovDragEnd(st);
     };
-    if (!mouse) st.timer = setTimeout(() => this.ovDragStart(st), 380);
+    if (!mouse && !now) st.timer = setTimeout(() => this.ovDragStart(st), 380);
     window.addEventListener('pointermove', move, true);
     window.addEventListener('pointerup', up, true);
     window.addEventListener('pointercancel', up, true);
+    if (now) { clearTimeout(st.timer); this.ovDragStart(st); }
   }
 
   ovDragStart(st) {
