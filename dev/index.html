@@ -66,6 +66,7 @@
     async readFile(src) { if (!files.has(src)) throw new Error('file not found: ' + src); return files.get(src).slice().buffer; },
     async pickPdf() { return [...files.keys()].find((k) => /\.pdf$/i.test(k)) || null; },
     async pickImage() { return [...files.keys()].find((k) => !/\.pdf$/i.test(k)) || null; },
+    setPos(pos) { localStorage.setItem(KEY + '-pos', JSON.stringify(pos)); },
     getClipboard() { return clip; },
     setClipboard(s) { clip = s; },
     async saveFile(suffix, buffer, mime) {
@@ -77,7 +78,7 @@
     },
   };
   const editor = window.editor = new Plugin.Editor(document.getElementById('app'), host);
-  editor.load(T.parseNotebook(localStorage.getItem(KEY) || '', prefs));
+  editor.load(T.parseNotebook(localStorage.getItem(KEY) || '', prefs), JSON.parse(localStorage.getItem(KEY + '-pos') || 'null') || { page: 0 });
 </script>
 </body>
 </html>
