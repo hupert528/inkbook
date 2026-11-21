@@ -1,7 +1,7 @@
 # Inkbook
 
 Lightweight handwritten notebooks for Obsidian, built for iPad + Apple Pencil.
-One file (`main.js`, about 100 KB), no dependencies, no build step.
+One file (`main.js`, about 125 KB), no dependencies, no build step.
 
 ## Install
 
@@ -27,12 +27,31 @@ needed if you paste directly into `.obsidian/plugins`). With Obsidian Sync, enab
 - **Erase:** scribble back and forth over ink with the pen, or use the eraser tool. The eraser has
   two modes: **Precise** rubs out only the ink under the circle (cutting strokes in two where
   needed); **Stroke** removes every stroke it passes over.
-- **Straight lines and circles:** draw, then hold the pencil still for half a second — or use the
-  shape pen, which always corrects.
+- **Straight lines and circles:** draw, then keep the pencil still for a moment (about a third of a
+  second) without lifting it. Lines within a few degrees of level or upright become exactly
+  horizontal or vertical. Still holding, move the pencil to adjust: a line's end follows it, a
+  circle grows or shrinks. After you lift, a circle keeps its handles for 3 seconds — drag a corner
+  to resize it or the top handle to turn it.
+- **Picks up where you left off:** each notebook reopens on the page, zoom and scroll position you
+  last had.
 - **Lasso:** circle some ink, then drag it to move, or use the popup to copy / cut / duplicate /
-  delete. Paste works on any page or in another notebook. Tapping a colour recolours the selection.
+  delete. Tap a single stroke, text box or picture to select just that. Corner handles resize, the
+  handle on top turns. Paste works on any page or in another notebook. Tapping a colour recolours
+  the selection.
+- **Text boxes** (T "Add text" tool, last of the tools): tap the page and type; tap a text box to change it. Colour and the three
+  text sizes apply while typing. Tap elsewhere or hide the keyboard to finish. Move, resize or turn a
+  text box with the lasso; the lasso popup also has **Edit text**.
+- **Pictures** (picture button, or paste on desktop): a photo from the camera roll / Files, or a
+  picture already in the vault. Camera photos are scaled down to 2000 px and saved as JPEG in your
+  attachments folder (usually 200–500 KB each); the notebook only links to them, so keep them in
+  the vault. Pictures sit under the ink, so you can write on them.
+- **Undo** also covers adding, deleting, moving and importing pages.
 - **All pages:** tap the page number (or the grid button next to it) for a thumbnail overview. Tap a
-  page to jump to it; tap **Select** to pick pages to export as a PDF or delete.
+  page to jump to it; drag a page by its ⠿ handle (or hold the page) to move it; tap **Select** to
+  pick pages to export as a PDF or delete.
+- **Bookmarks:** the bookmark button next to the page number marks the current page (it turns red).
+  In All pages, bookmarked pages have a red ribbon — tap any ribbon to add or remove a bookmark —
+  and **Bookmarks** shows only those pages.
 - **Import a PDF** (⋯ menu): from the vault or from the device (Files app on iPad). Each PDF page
   becomes a notebook page you can write on. On desktop you can also paste a PDF file with Ctrl/Cmd+V.
   PDFs from the device are saved into your attachments folder; the notebook links to them, so keep
@@ -50,7 +69,11 @@ and stored packed (file format version 2), which comes to roughly 100–150 byte
 stroke — a densely written page is in the region of 100–200 KB. Notebooks made with
 earlier versions open as usual and are rewritten in the compact format (about 5–7× smaller) the next
 time you change them. Update the plugin on all your devices: a device still on an older version
-will refuse to open a compact notebook (it leaves the file untouched).
+will refuse to open a compact notebook (it leaves the file untouched). The same goes for notebooks
+with text boxes or pictures, which need version 0.4.0 or later.
+
+PDF export writes text boxes as real, selectable text in Helvetica. It covers Western European
+characters; anything else (e.g. emoji, Greek, CJK) shows as "?" in the PDF only.
 
 ## Testing without Obsidian
 
@@ -63,4 +86,5 @@ will refuse to open a compact notebook (it leaves the file untouched).
 2. BRAT settings → **Add beta plugin** → paste this repository's URL → Add.
 3. Enable **Inkbook** under Community plugins. BRAT keeps it updated from new GitHub releases.
 
-(Each release must have `main.js`, `manifest.json` and `styles.css` attached.)
+Each release must have `main.js`, `manifest.json` and `styles.css` attached with exactly those names
+(not `manifest.json.txt`), and its tag should match the version in `manifest.json` (e.g. `0.4.0`).
