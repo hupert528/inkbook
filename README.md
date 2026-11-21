@@ -86,5 +86,8 @@ characters; anything else (e.g. emoji, Greek, CJK) shows as "?" in the PDF only.
 2. BRAT settings → **Add beta plugin** → paste this repository's URL → Add.
 3. Enable **Inkbook** under Community plugins. BRAT keeps it updated from new GitHub releases.
 
-Each release must have `main.js`, `manifest.json` and `styles.css` attached with exactly those names
-(not `manifest.json.txt`), and its tag should match the version in `manifest.json` (e.g. `0.4.0`).
+**Making a release:** on GitHub, Releases → Draft a new release, pick a tag (ideally the version in
+`manifest.json`), and Publish. You don't need to attach anything: a GitHub Action attaches the right
+`main.js`, `manifest.json` and `styles.css` from that code within a minute (see the Actions tab).
+To fix a release that has wrong files, Actions → "Attach plugin files to release" → Run workflow,
+and type the release's tag.
