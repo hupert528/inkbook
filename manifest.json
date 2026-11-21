@@ -3,7 +3,7 @@
   "name": "Inkbook",
   "version": "0.4.4",
   "minAppVersion": "1.4.0",
-  "description": "Lightweight handwritten notebooks with Apple Pencil support: paper templates, lasso, shape correction, scribble-to-erase, text boxes, pictures and PDF import/export.",
-  "author": "Harry",
+  "description": "Lightweight handwritten notebooks",
+  "author": "hupert528",
   "isDesktopOnly": false
 }
