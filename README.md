@@ -27,11 +27,9 @@ needed if you paste directly into `.obsidian/plugins`). With Obsidian Sync, enab
 - **Erase:** scribble back and forth over ink with the pen, or use the eraser tool. The eraser has
   two modes: **Precise** rubs out only the ink under the circle (cutting strokes in two where
   needed); **Stroke** removes every stroke it passes over.
-- **Straight lines and circles:** draw, then keep the pencil still for a moment (about a third of a
-  second) without lifting it. Lines within a few degrees of level or upright become exactly
-  horizontal or vertical. Still holding, move the pencil to adjust: a line's end follows it, a
-  circle grows or shrinks. After you lift, a circle keeps its handles for 3 seconds — drag a corner
-  to resize it or the top handle to turn it.
+- **Straight lines and circles:** draw, then pause with the pencil still down for a moment (about
+  a fifth of a second). Still holding, move the pencil to adjust: a line's end follows it, a circle
+  grows or shrinks.
 - **Picks up where you left off:** each notebook reopens on the page, zoom and scroll position you
   last had.
 - **Lasso:** circle some ink, then drag it to move, or use the popup to copy / cut / duplicate /
