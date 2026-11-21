@@ -371,15 +371,6 @@ function cutStroke(s, cx, cy, R) {
   return out.filter((q) => q.length >= 6 && pathLength(q, 3) > 0.25).map((q) => Object.assign({}, s, { p: q }));
 }
 
-/* Snaps a line to exactly horizontal / vertical when it is within about 4 degrees of it. */
-function snapAxis(ax, ay, bx, by) {
-  const dx = bx - ax, dy = by - ay, l = Math.hypot(dx, dy);
-  if (l < 1) return [bx, by];
-  if (Math.abs(dy) / l < 0.07) return [bx, ay];
-  if (Math.abs(dx) / l < 0.07) return [ax, by];
-  return [bx, by];
-}
-
 /* Recognises a straight line { k:'line', ax, ay, bx, by, pr } or a circle / ellipse
    { k:'ell', cx, cy, rx, ry, rot, pr } in the points p, or returns null. */
 function recognizeShape(p) {
@@ -393,33 +384,9 @@ function recognizeShape(p) {
   pr = r2(pr / n);
   const ax = p[0], ay = p[1], bx = p[p.length - 3], by = p[p.length - 2];
   const chord = Math.hypot(bx - ax, by - ay);
-  // A line: the ink stays close to the best-fitting straight line through it. The first and last
-  // stretch (up to 10 pt) are left out of that test — that is where the pencil hooks as it lands
-  // or lifts — so a hook neither stops the snap nor tilts the line. Bends or wiggles in the
-  // middle mean it is not a line.
-  if (chord >= 12 && chord / len > 0.7) {
-    const trim = Math.min(10, len * 0.1), mid = [];
-    for (let i = 0, c = 0; i < p.length; i += 3) {
-      if (i) c += Math.hypot(p[i] - p[i - 3], p[i + 1] - p[i - 2]);
-      if (c >= trim && c <= len - trim) mid.push(p[i], p[i + 1]);
-    }
-    const m = mid.length >= 6 ? mid : p.filter((_, i) => i % 3 < 2), k = m.length / 2;
-    let mx = 0, my = 0;
-    for (let i = 0; i < m.length; i += 2) { mx += m[i]; my += m[i + 1]; }
-    mx /= k; my /= k;
-    let sxx = 0, syy = 0, sxy = 0;
-    for (let i = 0; i < m.length; i += 2) { const dx = m[i] - mx, dy = m[i + 1] - my; sxx += dx * dx; syy += dy * dy; sxy += dx * dy; }
-    let ang = 0.5 * Math.atan2(2 * sxy, sxx - syy);
-    const q = Math.PI / 2, near = Math.round(ang / q) * q;
-    if (Math.abs(ang - near) < 0.07) ang = near;             // within ~4 degrees: exactly level / upright
-    const ux = Math.cos(ang), uy = Math.sin(ang), tol = Math.max(3, chord * 0.05);
-    let ok = true;
-    for (let i = 0; i < m.length && ok; i += 2) ok = Math.abs(-(m[i] - mx) * uy + (m[i + 1] - my) * ux) <= tol;
-    if (ok) {
-      const ta = (ax - mx) * ux + (ay - my) * uy, tb = (bx - mx) * ux + (by - my) * uy;
-      return { k: 'line', ax: mx + ux * ta, ay: my + uy * ta, bx: mx + ux * tb, by: my + uy * tb, pr };
-    }
-  }
+  // A line: the ink is nearly as short as the straight path from start to end. 0.8 lets fairly
+  // rough lines through; anything that bends a lot or doubles back is not a line.
+  if (chord / len > 0.8) return { k: 'line', ax, ay, bx, by, pr };
   if (chord / len < 0.3) {
     const b = ptsBox(p, 3);
     const cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2;
@@ -1575,11 +1542,6 @@ class Editor {
     const [x, y] = this.toPage(e), p = this.prefs, id = e.pointerId, touch = e.pointerType === 'touch';
     let tool = p.tool;
     if (e.pointerType === 'pen' && ((e.buttons & 32) || e.button === 5)) tool = 'eraser';   // pencil eraser end / button
-    if (this.selTemp) {
-      const h = this.selHandleAt(x, y);
-      if (h !== null && (tool === 'pen' || tool === 'highlighter')) { this.startTransform(h, x, y, id, touch); return; }
-      this.clearSelection(); this.clearLive();
-    }
     if (tool === 'text') {
       this.act = { type: 'tap', id, touch, x0: x, y0: y, moved: false, typing: this.wasTyping };
     } else if (tool === 'eraser') {
@@ -1602,7 +1564,7 @@ class Editor {
         s: { t: hl ? 'highlighter' : 'pen', c: hl ? p.hlColor : p.penColor, w: hl ? p.hlSize : p.penSize, p: [r2(x), r2(y), pr] },
         sx: x, sy: y, sp: pr,           // stabilised position
         rx: x, ry: y,                   // raw position
-        ax: x, ay: y, holdN: 3,         // anchor for hold-to-snap, and how much ink came before it
+        ax: x, ay: y,                   // anchor for hold-to-snap
         box: null, snapped: null, timer: 0,
       };
       this.armHold(this.act);
@@ -1656,18 +1618,9 @@ class Editor {
     const sh = a.shape;
     if (sh) {
       // Still holding after the snap: the pen drags a line's end point, or resizes (and turns) a
-      // circle / ellipse around its centre. The tremble of a held pencil changes nothing; only a
-      // deliberate move does.
-      if (!a.following) {
-        if (Math.hypot(x - a.ax, y - a.ay) < 8 / this.scale) return;
-        a.following = true;
-      }
-      if (sh.k === 'line') {
-        const dx = a.base.bx - sh.ax, dy = a.base.by - sh.ay, l = Math.hypot(dx, dy) || 1, ux = dx / l, uy = dy / l;
-        const px = x - sh.ax, py = y - sh.ay, along = px * ux + py * uy;
-        if (along > 0 && Math.abs(px * uy - py * ux) < along * 0.17) { sh.bx = sh.ax + ux * along; sh.by = sh.ay + uy * along; }   // same direction: longer / shorter
-        else [sh.bx, sh.by] = snapAxis(sh.ax, sh.ay, x, y);
-      } else {
+      // circle / ellipse around its centre.
+      if (sh.k === 'line') { sh.bx = x; sh.by = y; }
+      else {
         const b = a.base, k = Math.max(0.05, Math.hypot(x - b.cx, y - b.cy) / a.d0);
         sh.rx = b.rx * k; sh.ry = b.ry * k;
         if (b.rx !== b.ry) sh.rot = b.rot + Math.atan2(y - b.cy, x - b.cx) - a.a0;
@@ -1675,7 +1628,7 @@ class Editor {
       a.snapped = shapePts(sh);
       return;
     }
-    if (Math.hypot(x - a.ax, y - a.ay) > 8 / this.scale) { a.ax = x; a.ay = y; a.holdN = a.s.p.length; this.armHold(a); }
+    if (Math.hypot(x - a.ax, y - a.ay) > 8 / this.scale) { a.ax = x; a.ay = y; this.armHold(a); }
     const k = 1 - clamp(this.prefs.stabilize, 0, 0.9);  // stabiliser: ink trails the pen slightly
     a.sx += (x - a.sx) * k; a.sy += (y - a.sy) * k; a.sp += (pr - a.sp) * k;
     const p = a.s.p, n = p.length;
@@ -1683,29 +1636,12 @@ class Editor {
     p.push(r2(a.sx), r2(a.sy), r2(a.sp));
   }
 
-  /* A circle just drawn keeps its handles for a few seconds: drag a corner to resize it, the top
-     handle to turn it. Writing anywhere else carries on as normal. */
-  selectBriefly(s) {
-    this.select(new Set([s]), true);
-    this.armTemp();
-  }
-
-  armTemp() {
-    clearTimeout(this.tempTimer);
-    this.tempTimer = setTimeout(() => {
-      if (!this.selTemp) return;
-      if (this.act) this.armTemp(); else this.clearSelection();
-    }, 3000);
-  }
-
   armHold(a) {
     clearTimeout(a.timer);
     if (!this.prefs.holdSnap) return;
     a.timer = setTimeout(() => {
       if (this.act !== a || a.shape) return;
-      // Only the ink drawn before the pen stopped counts: a held pencil still trembles a little, and
-      // that tremble must not make a straight line look bent.
-      const sh = recognizeShape(a.s.p.slice(0, Math.max(3, a.holdN)).concat([r2(a.ax), r2(a.ay), r2(a.sp)]));
+      const sh = recognizeShape(a.s.p.concat([r2(a.rx), r2(a.ry), r2(a.sp)]));
       if (!sh) return;
       a.shape = sh; a.snapped = shapePts(sh); a.base = Object.assign({}, sh);
       if (sh.k === 'ell') {
@@ -1713,7 +1649,7 @@ class Editor {
         a.a0 = Math.atan2(a.ry - sh.cy, a.rx - sh.cx);
       }
       this.queueLive();
-    }, 350);
+    }, 200);
   }
 
   cancelAct() {
@@ -1748,7 +1684,6 @@ class Editor {
       page.strokes.push(a.s);
       drawStroke(this.ctxOf(this.main), a.s);
       this.clearLive(); this.changed();
-      if (a.shape && a.shape.k === 'ell') this.selectBriefly(a.s);
       return;
     }
     if (a.type === 'tap') {
@@ -1789,7 +1724,6 @@ class Editor {
         });
         this.changed();
       }
-      if (this.selTemp) this.armTemp();
       this.placeSelBar();
     }
     this.queueLive();
@@ -1894,16 +1828,14 @@ class Editor {
     return !!b && x >= b.x0 - m && x <= b.x1 + m && y >= b.y0 - m && y <= b.y1 + m;
   }
 
-  select(set, temp) {
+  select(set) {
     this.sel = set; this.selM = null;
-    this.selTemp = !!temp; clearTimeout(this.tempTimer);
     this.computeSelBox();
     this.renderMain(); this.queueLive(); this.placeSelBar();
   }
 
   dropSelection() {
     this.sel = new Set(); this.selBox = null; this.selM = null;
-    this.selTemp = false; clearTimeout(this.tempTimer);
     this.selBar.style.display = 'none';
   }
 
@@ -1927,7 +1859,7 @@ class Editor {
   placeSelBar() {
     const bar = this.selBar, b = this.selBox;
     const busy = this.act && (this.act.type === 'move' || this.act.type === 'scale' || this.act.type === 'rotate');
-    if (!b || !this.sel.size || busy || this.selTemp) { bar.style.display = 'none'; return; }
+    if (!b || !this.sel.size || busy) { bar.style.display = 'none'; return; }
     bar.style.display = 'flex';
     const one = this.sel.size === 1 ? [...this.sel][0] : null;
     this.editBtn.style.display = one && one.k === 'text' ? '' : 'none';
