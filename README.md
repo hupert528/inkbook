@@ -1,20 +1,16 @@
 # Inkbook
 
-Lightweight handwritten notebooks for Obsidian, built for iPad + Apple Pencil.
-One file (`main.js`, about 125 KB), no dependencies, no build step.
+Lightweight handwritten notebooks for Obsidian (Apple pencil compatibility)
+Everything stored locally and/or in cloud
 
 ## Install
 
-1. In your vault, open the hidden folder `.obsidian/plugins/` (create `plugins` if it is missing).
-2. Make a folder called `inkbook` there and copy in **`main.js`**, **`manifest.json`** and **`styles.css`**.
-3. In Obsidian: Settings → Community plugins → turn off Restricted mode → enable **Inkbook**.
+1 -  Install BRAT in community plugins on obsidian and enabl
+2 - Copy the repository link into BRAT install
 
-**Getting it onto the iPad:** if the vault is in iCloud Drive, do the steps above on any device and it
-syncs across (on iPad you can also copy the folder with the Files app — show hidden files is not
-needed if you paste directly into `.obsidian/plugins`). With Obsidian Sync, enable syncing of
-"Installed community plugins" and "All other file types" (notebooks are `.inknote` files).
 
-## Use
+
+## Features
 
 - **New notebook:** pencil icon in the left ribbon, the command "Inkbook: New notebook", or long-press /
   right-click a folder → "New ink notebook". Notebooks are ordinary files, so make a folder per
@@ -60,32 +56,7 @@ needed if you paste directly into `.obsidian/plugins`). With Obsidian Sync, enab
 
 Defaults (page style, stabilisation strength, pressure, finger drawing…) are in Settings → Inkbook.
 
-## File size
-
-Notebooks are small text files. Ink is thinned to the points that matter when you lift the pencil
-and stored packed (file format version 2), which comes to roughly 100–150 bytes per pen
-stroke — a densely written page is in the region of 100–200 KB. Notebooks made with
-earlier versions open as usual and are rewritten in the compact format (about 5–7× smaller) the next
-time you change them. Update the plugin on all your devices: a device still on an older version
-will refuse to open a compact notebook (it leaves the file untouched). The same goes for notebooks
-with text boxes or pictures, which need version 0.4.0 or later.
-
-PDF export writes text boxes as real, selectable text in Helvetica. It covers Western European
-characters; anything else (e.g. emoji, Greek, CJK) shows as "?" in the PDF only.
-
 ## Testing without Obsidian
 
 `dev/index.html` runs the drawing engine in a normal browser with the Obsidian API stubbed out
 (serve the `inkbook` folder with `python -m http.server`). It is not needed for the plugin.
-
-## Install with BRAT (easiest on iPad)
-
-1. Install the **BRAT** community plugin and enable it.
-2. BRAT settings → **Add beta plugin** → paste this repository's URL → Add.
-3. Enable **Inkbook** under Community plugins. BRAT keeps it updated from new GitHub releases.
-
-**Making a release:** on GitHub, Releases → Draft a new release, pick a tag (ideally the version in
-`manifest.json`), and Publish. You don't need to attach anything: a GitHub Action attaches the right
-`main.js`, `manifest.json` and `styles.css` from that code within a minute (see the Actions tab).
-To fix a release that has wrong files, Actions → "Attach plugin files to release" → Run workflow,
-and type the release's tag.
