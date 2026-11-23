@@ -2744,7 +2744,10 @@ class FilePickModal extends obsidian.FuzzySuggestModal {
 }
 
 class InkbookView extends obsidian.TextFileView {
-  constructor(leaf, plugin) { super(leaf); this.plugin = plugin; this.broken = null; this.editor = null; }
+  constructor(leaf, plugin) {
+    super(leaf); this.plugin = plugin; this.broken = null; this.editor = null;
+    this.shown = null;   // the file whose notebook is on screen; null while one is still loading
+  }
   getViewType() { return VIEW_TYPE; }
   getIcon() { return 'pencil'; }
   getDisplayText() { return this.file ? this.file.basename : 'Notebook'; }
@@ -2770,7 +2773,9 @@ class InkbookView extends obsidian.TextFileView {
       const nb = parseNotebook(data, this.plugin.settings);
       this.broken = null;
       this.errorEl.hide(); this.editor.root.style.display = '';
-      this.editor.load(nb, clear ? this.plugin.getPos(this.file) || { page: 0 } : null);
+      const opening = this.shown !== this.file;   // a different notebook than the one on screen
+      this.editor.load(nb, opening ? this.plugin.getPos(this.file) || { page: 0 } : null);
+      this.shown = this.file;
     } catch (e) {
       this.broken = data;
       this.editor.root.style.display = 'none';
@@ -2780,6 +2785,13 @@ class InkbookView extends obsidian.TextFileView {
   }
 
   clear() {}
+
+  // Closing this notebook (or switching to another file in this tab): forget which one is shown,
+  // so the next one's loading screen can't save over anything.
+  async onUnloadFile(file) {
+    this.shown = null;
+    return super.onUnloadFile(file);
+  }
 
   makeHost() {
     const plugin = this.plugin, view = this, app = plugin.app;
@@ -2841,7 +2853,7 @@ class InkbookView extends obsidian.TextFileView {
         await app.vault.createBinary(path, buffer);
         return path;
       },
-      setPos: (pos) => { if (view.file) plugin.setPos(view.file, pos); },
+      setPos: (pos) => { if (view.file && view.shown === view.file) plugin.setPos(view.file, pos); },
       getClipboard: () => plugin.clipboard,
       setClipboard: (s) => { plugin.clipboard = s; },
       saveFile: async (suffix, buffer, mime) => {
