@@ -1,7 +1,7 @@
 {
   "id": "inkbook",
   "name": "Inkbook",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "minAppVersion": "1.4.0",
   "description": "Lightweight handwritten notebooks",
   "author": "hupert528",
