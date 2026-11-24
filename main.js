@@ -22,6 +22,8 @@ const HL_SIZES = [8, 13, 20];
 const ERASER_SIZES = [8, 16, 30];
 const TEXT_SIZES = [12, 16, 24];
 const MAX_CANVAS_PX = 8e6;
+const BASE_PX = 3e6;                        // whole-page snapshots (current and neighbouring pages)
+const PAGE_GAP = 28;                        // space between pages while turning
 const MAX_PIC = 2000;                       // pictures are stored at most this many pixels across
 const MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', svg: 'image/svg+xml', heic: 'image/heic' };
 const PIC_EXTS = Object.keys(MIME);                  // keeps memory low and stays under iOS canvas limits
@@ -827,6 +829,10 @@ class Editor {
     // the canvases cover the visible area and are drawn at the screen's real pixel density.
     this.viewEl = el('div', 'inkbook-view', this.stage);
     this.pageEl = el('div', 'inkbook-page', this.viewEl);
+    // The pages either side, shown only while turning, so the next page slides in beside this one.
+    this.sides = [el('div', 'inkbook-page inkbook-side', this.viewEl), el('div', 'inkbook-page inkbook-side', this.viewEl)];
+    this.bases = new Map();           // page -> whole-page snapshot { c, k, dirty, bg }
+    this.turnState = null;            // page turn being animated
     this.main = el('canvas', 'inkbook-layer', this.viewEl);
     this.live = el('canvas', 'inkbook-layer', this.viewEl);
     this.rv = null;                   // the view the canvases were last drawn for
@@ -874,6 +880,7 @@ class Editor {
     document.removeEventListener('touchstart', this.guard, true);
     document.removeEventListener('touchmove', this.guard, true);
     this.closeText(true);
+    clearTimeout(this.baseTimer); this.dropBases();
     for (const e of this.imgs.values()) if (e.url) URL.revokeObjectURL(e.url);
     this.closeColors();
     this.closeOverview();
@@ -896,6 +903,7 @@ class Editor {
       this.pendingView = pos; this.ready = false; this.rv = null;
     } else this.pageIndex = clamp(this.pageIndex, 0, nb.pages.length - 1);
     this.closeText(true);
+    this.dropBases();
     this.undoStack = []; this.redoStack = [];
     this.act = null; this.dropSelection();
     if (resized) { this.ready = false; this.rv = null; }
@@ -909,19 +917,28 @@ class Editor {
   btn(parent, icon, label, fn) {
     const b = el('button', 'inkbook-btn', parent);
     b.setAttribute('aria-label', label);
+    b.title = label;
     this.host.setIcon(b, icon);
     b.addEventListener('click', (e) => { e.preventDefault(); fn(e); });
     return b;
   }
 
+  /* Three zones: edit actions on the left, the drawing tools centred, pages and menus on the right.
+     On a narrow pane the tools get a row of their own on top. */
   buildToolbar() {
     const t = this.toolbar;
     this.toolBtns = {};
-    const g1 = el('div', 'inkbook-group', t);
+    const left = el('div', 'inkbook-zone inkbook-zone-left', t);
+    const mid = el('div', 'inkbook-zone inkbook-zone-mid', t);
+    const right = el('div', 'inkbook-zone inkbook-zone-right', t);
+
+    const g1 = el('div', 'inkbook-group inkbook-tools', mid);
+    g1.setAttribute('role', 'toolbar'); g1.setAttribute('aria-label', 'Drawing tools');
     for (const [tool, icon, label] of TOOLS) this.toolBtns[tool] = this.btn(g1, icon, label, () => this.setTool(tool));
-    this.palette = el('div', 'inkbook-group', t);
-    this.sizes = el('div', 'inkbook-group', t);
-    const g2 = el('div', 'inkbook-group', t);
+    this.palette = el('div', 'inkbook-group', mid);
+    this.sizes = el('div', 'inkbook-group', mid);
+
+    const g2 = el('div', 'inkbook-group', left);
     this.undoBtn = this.btn(g2, 'undo-2|undo', 'Undo', () => this.undo());
     this.redoBtn = this.btn(g2, 'redo-2|redo', 'Redo', () => this.redo());
     this.pasteBtn = this.btn(g2, 'clipboard-paste|clipboard', 'Paste', () => this.paste());
@@ -929,16 +946,17 @@ class Editor {
       { title: 'Photo or file from this device…', icon: 'camera', click: () => this.pickDeviceImage() },
       { title: 'Picture from the vault…', icon: 'image', click: () => this.pickVaultImage() },
     ], e));
-    el('div', 'inkbook-spacer', t);
-    const g3 = el('div', 'inkbook-group', t);
+
+    const g3 = el('div', 'inkbook-group', right);
     this.prevBtn = this.btn(g3, 'chevron-left', 'Previous page', () => this.goTo(this.pageIndex - 1, -1));
-    this.pageLabel = el('div', 'inkbook-pagelabel', g3);
+    this.pageLabel = el('button', 'inkbook-pagelabel', g3);
+    this.pageLabel.title = 'All pages';
     this.pageLabel.addEventListener('click', () => this.openOverview());
     this.nextBtn = this.btn(g3, 'chevron-right', 'Next page', () => this.goTo(this.pageIndex + 1, 1));
     this.markBtn = this.btn(g3, 'bookmark', 'Bookmark this page', () => this.toggleMark(this.page));
     this.btn(g3, 'plus', 'Add page', () => this.addPage());
     this.btn(g3, 'layout-dashboard|layout-grid', 'All pages', () => this.openOverview());
-    const g4 = el('div', 'inkbook-group', t);
+    const g4 = el('div', 'inkbook-group', right);
     this.btn(g4, 'settings|settings-2', 'Settings: page style and pencil options', (e) => this.settingsMenu(e));
     this.btn(g4, 'more-horizontal|more-vertical', 'More', (e) => this.moreMenu(e));
     this.refreshToolbar();
@@ -946,7 +964,10 @@ class Editor {
 
   refreshToolbar() {
     const p = this.prefs, tool = p.tool;
-    for (const k in this.toolBtns) this.toolBtns[k].classList.toggle('is-active', k === tool);
+    for (const k in this.toolBtns) {
+      this.toolBtns[k].classList.toggle('is-active', k === tool);
+      this.toolBtns[k].setAttribute('aria-pressed', String(k === tool));
+    }
 
     // One swatch showing the current colour; tapping it opens a small popup with the rest.
     this.palette.textContent = '';
@@ -955,6 +976,7 @@ class Editor {
       // Precise rubs out only the ink under the circle; Stroke removes every stroke it touches.
       for (const [mode, label] of [['precise', 'Precise'], ['stroke', 'Stroke']]) {
         const b = el('button', 'inkbook-seg' + (p.eraserMode === mode ? ' is-active' : ''), this.palette);
+        b.setAttribute('aria-pressed', String(p.eraserMode === mode));
         b.textContent = label;
         b.setAttribute('aria-label', mode === 'precise' ? 'Erase only what is under the circle' : 'Erase whole strokes');
         b.addEventListener('click', (e) => { e.preventDefault(); p.eraserMode = mode; this.host.savePrefs(); this.refreshToolbar(); });
@@ -972,6 +994,7 @@ class Editor {
       const list = { hlSize: HL_SIZES, eraserSize: ERASER_SIZES, textSize: TEXT_SIZES, penSize: PEN_SIZES }[k];
       list.forEach((v, i) => {
         const b = el('button', 'inkbook-btn inkbook-size' + (p[k] === v ? ' is-active' : ''), this.sizes);
+        b.setAttribute('aria-pressed', String(p[k] === v));
         if (k === 'textSize') {
           b.setAttribute('aria-label', ['Small text', 'Medium text', 'Large text'][i]);
           const d = el('div', 'inkbook-aa', b);
@@ -988,6 +1011,7 @@ class Editor {
       });
     }
     this.refreshState();
+    this.fitToolbar();
   }
 
   /* Swatches are plain <div>s: themes restyle <button>s (padding, minimum sizes), which squashed
@@ -1036,6 +1060,8 @@ class Editor {
     this.prevBtn.disabled = this.pageIndex === 0;
     this.nextBtn.disabled = this.pageIndex >= this.nb.pages.length - 1;
     this.pageLabel.textContent = `${this.pageIndex + 1} / ${this.nb.pages.length}`;
+    this.pageLabel.setAttribute('aria-label', `Page ${this.pageIndex + 1} of ${this.nb.pages.length}. Show all pages`);
+    this.markBtn.setAttribute('aria-pressed', String(!!this.page.mark));
     const marked = !!this.page.mark;
     this.markBtn.classList.toggle('is-marked', marked);
     this.markBtn.setAttribute('aria-label', marked ? 'Remove bookmark from this page' : 'Bookmark this page');
@@ -1073,12 +1099,12 @@ class Editor {
     const nb = this.nb, page = this.page, p = this.prefs, items = [];
     const toggle = (key, title) => ({ title, checked: !!p[key], click: () => { p[key] = !p[key]; this.host.savePrefs(); } });
     for (const k in TEMPLATES) items.push({ title: TEMPLATES[k] + ' page', checked: page.tpl === k, click: () => { page.tpl = k; this.renderMain(); this.changed(); } });
-    items.push({ title: 'Use this style on all pages', click: () => { for (const q of nb.pages) q.tpl = page.tpl; this.changed(); } });
+    items.push({ title: 'Use this style on all pages', click: () => { for (const q of nb.pages) q.tpl = page.tpl; this.dropBases(); this.layout(); this.changed(); } });
     items.push('-');
-    for (const [v, title] of SPACINGS) items.push({ title: 'Grid: ' + title.toLowerCase(), checked: Math.abs(nb.spacing - v) < 0.1, click: () => { nb.spacing = v; this.renderMain(); this.changed(); } });
+    for (const [v, title] of SPACINGS) items.push({ title: 'Grid: ' + title.toLowerCase(), checked: Math.abs(nb.spacing - v) < 0.1, click: () => { nb.spacing = v; this.dropBases(); this.layout(); this.changed(); } });
     items.push('-');
-    items.push({ title: 'White paper', checked: nb.paper === 'white', click: () => { nb.paper = 'white'; this.renderMain(); this.changed(); } });
-    items.push({ title: 'Cream paper', checked: nb.paper === 'cream', click: () => { nb.paper = 'cream'; this.renderMain(); this.changed(); } });
+    items.push({ title: 'White paper', checked: nb.paper === 'white', click: () => { nb.paper = 'white'; this.dropBases(); this.layout(); this.changed(); } });
+    items.push({ title: 'Cream paper', checked: nb.paper === 'cream', click: () => { nb.paper = 'cream'; this.dropBases(); this.layout(); this.changed(); } });
     items.push('-');
     items.push(toggle('fingerDraw', 'Draw with finger'), toggle('scribbleErase', 'Scribble to erase'), toggle('holdSnap', 'Hold to straighten lines and circles'));
     this.host.menu(items, evt);
@@ -1108,8 +1134,11 @@ class Editor {
   layout() {
     const cw = this.stage.clientWidth, ch = this.stage.clientHeight;
     if (!cw || !ch) return;
-    this.pageEl.style.width = this.nb.w + 'px';
-    this.pageEl.style.height = this.nb.h + 'px';
+    for (const p of [this.pageEl, ...this.sides]) {
+      p.style.width = this.nb.w + 'px'; p.style.height = this.nb.h + 'px';
+      p.style.background = (PAPERS[this.nb.paper] || PAPERS.white).bg;
+    }
+    this.fitToolbar();
     if (!this.ready) {
       this.ready = true; this.fit();
       // Same zoom and scroll as last time — unless the window is now a different width.
@@ -1118,6 +1147,18 @@ class Editor {
       if (v && v.s > 0 && Math.abs((v.cw || 0) - cw) < 40) { this.scale = v.s; this.tx = v.tx; this.ty = v.ty; }
     }
     this.clampPan(); this.applyTransform(); this.render();
+  }
+
+  /* Toolbar layout by available width: tools exactly centred with room on both sides; otherwise
+     centred in the space between the side zones on one row; otherwise on a centred row of their
+     own above the rest. */
+  fitToolbar() {
+    const z = this.toolbar.children, W = this.toolbar.clientWidth;
+    if (!W || z.length < 3) return;
+    const L = z[0].scrollWidth, M = z[1].scrollWidth, R = z[2].scrollWidth;
+    const centred = W >= 2 * Math.max(L, R) + M + 40, oneRow = W >= L + M + R + 40;
+    this.root.classList.toggle('is-squeezed', !centred && oneRow);
+    this.root.classList.toggle('is-narrow', !oneRow);
   }
 
   fit() {
@@ -1153,6 +1194,11 @@ class Editor {
   applyTransform(extra) {
     this.viewEl.style.transform = this.slideCss(extra);
     this.pageEl.style.transform = `translate(${this.tx}px,${this.ty}px) scale(${this.scale})`;
+    // Neighbours sit one page-width (plus a gap) to each side, at the scroll position they will
+    // have once turned to, so finishing a turn doesn't jump.
+    const D = this.nb.w * this.scale + PAGE_GAP, ty = this.newPageTy();
+    this.sides[0].style.transform = `translate(${this.tx - D}px,${ty}px) scale(${this.scale})`;
+    this.sides[1].style.transform = `translate(${this.tx + D}px,${ty}px) scale(${this.scale})`;
     const v = this.rv;
     if (v) {
       const k = this.scale / v.s;
@@ -1161,6 +1207,12 @@ class Editor {
     }
     this.placeSelBar(); this.placeText();
     if (v && (v.s !== this.scale || v.tx !== this.tx || v.ty !== this.ty)) this.renderSoon();
+  }
+
+  /* The scroll position a page gets when you turn to it: its top, as far as the zoom allows. */
+  newPageTy() {
+    const r = this.panRange();
+    return clamp(12, r.y[0], r.y[1]);
   }
 
   zoomAt(cx, cy, s) {
@@ -1196,6 +1248,7 @@ class Editor {
       c.style.transform = 'none';
     }
     this.rv = { tx: this.tx, ty: this.ty, s: this.scale, k: pw / W, mx, my };
+    this.showBase();
     this.renderMain(); this.paintLive();
     if (this.host.setPos) this.host.setPos({ page: this.pageIndex, s: this.scale, tx: Math.round(this.tx), ty: Math.round(this.ty), cw });
   }
@@ -1206,12 +1259,109 @@ class Editor {
     return ctx;
   }
 
+  /* ---------------- whole-page snapshots ----------------
+     Each page nearby (this one and the ones either side) keeps a snapshot of the whole page at
+     about screen resolution, sitting under the sharp drawing. Panning past the sharp area shows the
+     snapshot instead of blank paper, and a page turn slides a ready-made snapshot in. */
+
+  baseK() {
+    const nb = this.nb, fit = Math.min((this.stage.clientWidth - 24) / nb.w, 1.8) || 1;
+    return Math.round(Math.min((window.devicePixelRatio || 1) * fit, Math.sqrt(BASE_PX / (nb.w * nb.h))) * 100) / 100;
+  }
+
+  baseFor(page) {
+    const k = this.baseK();
+    let b = this.bases.get(page);
+    if (!b || b.k !== k) {
+      if (b) this.freeBase(b);
+      b = { c: el('canvas', 'inkbook-base'), k, dirty: true, bg: null, bgLoading: false };
+      this.bases.set(page, b);
+    }
+    if (b.dirty) this.drawBase(page, b);
+    return b;
+  }
+
+  drawBase(page, b) {
+    const nb = this.nb, c = b.c;
+    b.dirty = false;
+    c.width = Math.round(nb.w * b.k); c.height = Math.round(nb.h * b.k);
+    const ctx = c.getContext('2d');
+    ctx.setTransform(b.k, 0, 0, b.k, 0, 0);
+    drawTemplate(ctx, nb, page);
+    if (page.bg) {
+      const r = b.bg || this.bgCached(this.bgLow, page.bg, 1.5, 6, () => this.baseDirty(page));
+      if (r && r.canvas) ctx.drawImage(r.canvas, r.fit.x, r.fit.y, r.fit.w, r.fit.h);
+      if (!b.bg && !b.bgLoading) {                 // the imported PDF page at snapshot resolution
+        b.bgLoading = true;
+        this.bgCanvas(page.bg, b.k).then((res) => {
+          if (this.bases.get(page) !== b) { res.canvas.width = 0; return; }
+          b.bg = res; this.baseDirty(page, true);
+        }, () => {});
+      }
+    }
+    this.drawContent(ctx, page, null, null, () => this.baseDirty(page, true));
+  }
+
+  freeBase(b) {
+    b.c.remove(); b.c.width = 0;
+    if (b.bg && b.bg.canvas) b.bg.canvas.width = 0;
+  }
+
+  dropBases() {
+    for (const b of this.bases.values()) this.freeBase(b);
+    this.bases.clear();
+  }
+
+  /* The page changed: its snapshot is redrawn a moment after you stop (now: redraw right away). */
+  baseDirty(page, now) {
+    const b = this.bases.get(page);
+    if (!b) return;
+    b.dirty = true;
+    if (now && !this.act && !this.turnState) { this.drawBase(page, b); return; }
+    this.scheduleBases();
+  }
+
+  scheduleBases() {
+    clearTimeout(this.baseTimer);
+    this.baseTimer = setTimeout(() => this.updateBases(), 250);
+  }
+
+  /* Keeps snapshots of this page and its neighbours (drawn while idle), and only those. */
+  updateBases() {
+    if (this.act || this.gesture || this.turnState) { this.scheduleBases(); return; }
+    const pages = this.nb.pages, i = this.pageIndex, keep = new Set([pages[i - 1], pages[i], pages[i + 1]]);
+    for (const [p, b] of this.bases) if (!keep.has(p)) { this.freeBase(b); this.bases.delete(p); }
+    this.showBase();
+    for (const p of keep) if (p) this.baseFor(p);
+  }
+
+  /* Puts the current page's snapshot under the sharp drawing. */
+  showBase() {
+    let b = this.bases.get(this.page);
+    if (!b || b.k !== this.baseK()) b = this.baseFor(this.page);
+    else if (b.dirty) this.scheduleBases();            // never redraw it in the way of the pencil
+    if (b.c.parentNode !== this.pageEl) {
+      for (const c of [...this.pageEl.children]) c.remove();
+      this.pageEl.appendChild(b.c);
+    }
+  }
+
+  /* Shows (on) or hides the neighbouring pages used while turning. */
+  showSides(on) {
+    this.sides.forEach((el, j) => {
+      const p = on ? this.nb.pages[this.pageIndex + (j ? 1 : -1)] : null;
+      if (!p) { el.style.visibility = 'hidden'; return; }
+      const b = this.baseFor(p);
+      if (b.c.parentNode !== el) { for (const c of [...el.children]) c.remove(); el.appendChild(b.c); }
+      el.style.visibility = 'visible';
+    });
+  }
+
   /* ---------------- painting ---------------- */
 
   renderMain() {
     if (!this.rv) return;
     const nb = this.nb, page = this.page;
-    this.pageEl.style.background = (PAPERS[nb.paper] || PAPERS.white).bg;
     const raw = this.main.getContext('2d');
     raw.setTransform(1, 0, 0, 1, 0, 0);
     raw.clearRect(0, 0, this.main.width, this.main.height);
@@ -1314,6 +1464,7 @@ class Editor {
      model's tx/ty, so any outside offset — scrolled containers, sidebars, a running animation,
      Obsidian's own zoom — can't make ink land away from the pencil tip. */
   measureOrigin() {
+    if (this.turnState) this.finishTurn();               // pencil down mid-turn: land on the new page now
     if (this.viewEl.getAnimations) for (const an of this.viewEl.getAnimations()) an.finish();
     const v = this.rv;
     if (!v || v.s !== this.scale || v.tx !== this.tx || v.ty !== this.ty) this.render();   // sharp before writing
@@ -1440,6 +1591,8 @@ class Editor {
     else if (this.sel.size && mod && k === 'c') this.copySel();
     else if (this.sel.size && mod && k === 'x') { this.copySel(); this.deleteSel(); }
     else if (this.sel.size && (k === 'delete' || k === 'backspace')) this.deleteSel();
+    else if (!mod && !this.sel.size && (k === 'arrowright' || k === 'pagedown')) this.goTo(this.pageIndex + 1, 1);
+    else if (!mod && !this.sel.size && (k === 'arrowleft' || k === 'pageup')) this.goTo(this.pageIndex - 1, -1);
     else done = false;
     if (done) { e.preventDefault(); e.stopPropagation(); }
   }
@@ -1506,12 +1659,16 @@ class Editor {
       const r = this.panRange();
       const stuck = dx < 0 ? this.tx <= r.x[0] + 0.5 : this.tx >= r.x[1] - 0.5;
       g.mode = Math.abs(dx) > Math.abs(dy) * 1.2 && stuck ? 'swipe' : 'pan';
+      if (g.mode === 'swipe') { if (this.turnState) this.finishTurn(); this.showSides(true); }
     }
     if (g.mode === 'pan') {
       this.tx = g.tx + dx; this.ty = g.ty + dy;
       this.clampPan(); this.applyTransform();
     } else {
       const last = this.pageIndex === this.nb.pages.length - 1;
+      const now = performance.now();
+      if (g.lt) g.vx = 0.7 * (g.vx || 0) + 0.3 * ((dx - g.lx) / Math.max(1, now - g.lt));   // px per ms, smoothed
+      g.lx = dx; g.lt = now;
       g.swipe = dx > 0 && this.pageIndex === 0 ? dx * 0.25 : dx;
       this.applyTransform(g.swipe);
       if (last && dx < 0) {
@@ -1526,14 +1683,17 @@ class Editor {
     this.gesture = null;
     this.hint.style.opacity = '0';
     if (!g || g.mode !== 'swipe') return;
-    const dx = cancel ? 0 : g.swipe, last = this.pageIndex === this.nb.pages.length - 1;
-    if (dx < -70 && !last) this.goTo(this.pageIndex + 1, 1);
-    else if (dx < -130 && last) this.addPage();
-    else if (dx > 70 && this.pageIndex > 0) this.goTo(this.pageIndex - 1, -1);
-    else {
-      this.applyTransform();
-      if (this.viewEl.animate) this.viewEl.animate([{ transform: this.slideCss(g.swipe) }, { transform: 'none' }], { duration: 140, easing: 'ease-out' });
-    }
+    const dx = cancel ? 0 : g.swipe, last = this.pageIndex === this.nb.pages.length - 1, v = g.vx || 0;
+    // A long drag or a quick flick turns the page.
+    const fwd = dx < -70 || (dx < -20 && v < -0.35), back = dx > 70 || (dx > 20 && v > 0.35);
+    if (fwd && !last) { this.turn(1, dx); return; }
+    if (back && this.pageIndex > 0) { this.turn(-1, dx); return; }
+    if (dx < -130 && last) { this.applyTransform(); this.showSides(false); this.addPage(); return; }
+    this.applyTransform();
+    if (this.viewEl.animate && dx) {
+      const an = this.viewEl.animate([{ transform: this.slideCss(dx) }, { transform: 'none' }], { duration: 160, easing: 'cubic-bezier(.25,.8,.3,1)' });
+      an.onfinish = () => { if (!this.gesture && !this.turnState) this.showSides(false); };
+    } else this.showSides(false);
   }
 
   /* ---------------- pencil actions ---------------- */
@@ -1956,6 +2116,7 @@ class Editor {
       to.push({ page: h.page, strokes: h.page.strokes.slice(), items: h.page.items ? h.page.items.slice() : null });
       h.page.strokes = h.strokes;
       if (h.items) h.page.items = h.items; else delete h.page.items;
+      this.baseDirty(h.page);
       this.showPage(i);
       this.changed();
       return;
@@ -1973,30 +2134,58 @@ class Editor {
 
   changed() {
     this.host.changed();
+    this.baseDirty(this.page);
     this.refreshState();
   }
 
   /* ---------------- pages ---------------- */
 
+  /* dir (+1 / -1) slides the neighbouring page in; without it the page just changes. */
   goTo(i, dir) {
     if (i < 0 || i >= this.nb.pages.length || this.act) return;
+    if (this.turnState) this.finishTurn();
+    if (dir && i === this.pageIndex + dir) { this.turn(dir, 0); return; }
     this.closeText();
     this.dropSelection();
     this.pageIndex = i;
-    this.ty = 12; this.clampPan();
+    this.ty = this.newPageTy();
     this.applyTransform();
     this.render(); this.clearLive(); this.refreshState();
-    if (dir && this.viewEl.animate) {
-      this.viewEl.animate(
-        [{ transform: this.slideCss(dir * 90), opacity: 0.3 }, { transform: 'none', opacity: 1 }],
-        { duration: 170, easing: 'ease-out' });
-    }
+    this.scheduleBases();
+  }
+
+  /* Slides from the current page (already dragged `from` px by a finger) to the next (dir 1) or
+     previous (dir -1) page. The page is switched once it has fully arrived. */
+  turn(dir, from) {
+    const i = this.pageIndex + dir;
+    if (i < 0 || i >= this.nb.pages.length || this.act) return;
+    this.closeText(); this.dropSelection(); this.clearLive();
+    const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (!this.viewEl.animate || reduce) { this.goTo(i); return; }
+    this.showSides(true);
+    const D = this.nb.w * this.scale + PAGE_GAP, to = -dir * D;
+    const dur = clamp((Math.abs(to - from) / D) * 280, 90, 280);
+    const an = this.viewEl.animate([{ transform: this.slideCss(from) }, { transform: this.slideCss(to) }],
+      { duration: dur, easing: 'cubic-bezier(.25,.8,.3,1)', fill: 'forwards' });
+    this.turnState = { i, an };
+    an.onfinish = () => this.finishTurn();
+  }
+
+  finishTurn() {
+    const t = this.turnState;
+    if (!t) return;
+    this.turnState = null;
+    t.an.onfinish = null;
+    this.viewEl.style.transform = 'none';
+    t.an.cancel();
+    this.goTo(t.i);                                   // the new page is exactly where its neighbour was
+    this.showSides(false);
   }
 
   addPage() {
     this.pushPages();
     this.nb.pages.splice(this.pageIndex + 1, 0, { id: uid(), tpl: this.page.tpl, strokes: [] });
-    this.goTo(this.pageIndex + 1, 1);
+    this.turn(1, 0);
     this.changed();
   }
 
