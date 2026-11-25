@@ -73,7 +73,7 @@
 
 /* Narrow pane (iPad portrait, split view): tools on their own centred row on top. */
 .inkbook-root.is-narrow .inkbook-toolbar {
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: auto 1fr;
   grid-template-areas: "mid mid" "left right";
 }
 
@@ -546,4 +546,99 @@
   .inkbook-view {
     will-change: auto;
   }
+}
+
+/* Full-screen writing: the editor covers the whole screen and the toolbar folds into a corner button. */
+.inkbook-root.is-focus {
+  position: fixed;
+  inset: 0;
+  z-index: calc(var(--layer-modal, 50) - 1);
+  height: auto;
+  padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
+  background: var(--background-secondary, #e8e8ec);
+}
+
+.inkbook-root.is-focus .inkbook-toolbar {
+  display: none;
+}
+
+/* Unfolded: the toolbar is a vertical strip down the right edge, under the corner button. Its groups
+   dissolve so every button is one cell in a column; drawing tools first, then edit, then pages. */
+.inkbook-root.is-focus.is-open .inkbook-toolbar {
+  display: grid;
+  position: absolute;
+  z-index: 15;
+  top: calc(env(safe-area-inset-top, 0px) + 60px);
+  right: calc(env(safe-area-inset-right, 0px) + 6px);
+  left: auto;
+  grid-template-columns: none;
+  grid-template-areas: none;
+  grid-auto-flow: column;
+  grid-auto-columns: auto;
+  justify-items: center;
+  align-items: center;
+  gap: 4px 2px;
+  padding: 6px 2px;
+  direction: rtl;   /* a second column, if needed, grows leftwards away from the edge */
+  border: 1px solid var(--background-modifier-border, #dcdce0);
+  border-radius: 14px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.18);
+}
+
+.inkbook-root.is-focus.is-open .inkbook-zone,
+.inkbook-root.is-focus.is-open .inkbook-toolbar .inkbook-group {
+  display: contents;
+}
+
+.inkbook-root.is-focus.is-open .inkbook-toolbar .inkbook-group > * {
+  direction: ltr;
+}
+
+.inkbook-root.is-focus.is-open .inkbook-zone-left .inkbook-group > * {
+  order: 1;
+}
+
+.inkbook-root.is-focus.is-open .inkbook-zone-right .inkbook-group > * {
+  order: 2;
+}
+
+.inkbook-root.is-focus.is-open button.inkbook-pagelabel {
+  min-width: 0;
+  width: 44px;
+  padding: 0;
+  font-size: 11px;
+}
+
+.inkbook-root button.inkbook-fab {
+  display: none;
+}
+
+.inkbook-root.is-focus button.inkbook-fab {
+  position: absolute;
+  z-index: 16;
+  top: calc(env(safe-area-inset-top, 0px) + 8px);
+  right: calc(env(safe-area-inset-right, 0px) + 8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  margin: 0;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  color: var(--text-normal, #222);
+  background: var(--background-primary, #fff);
+  box-shadow: inset 0 0 0 3px var(--ink, transparent), 0 2px 10px rgba(0, 0, 0, 0.25);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.inkbook-root.is-focus button.inkbook-fab svg {
+  width: 20px;
+  height: 20px;
+}
+
+.inkbook-root.is-measuring .inkbook-zone {
+  flex-wrap: nowrap;
 }

@@ -838,6 +838,12 @@ class Editor {
     this.rv = null;                   // the view the canvases were last drawn for
     this.hint = el('div', 'inkbook-hint', this.stage);
     this.selBar = el('div', 'inkbook-selbar', this.stage);
+    // Full-screen writing: the whole UI folds into this one button in the corner.
+    this.home = parent;               // where the editor lives when not full screen
+    this.focusMode = false;           // full-screen writing on
+    this.focusOpen = false;           // ...with the toolbar unfolded
+    this.fab = el('button', 'inkbook-fab', this.root);
+    this.fab.addEventListener('click', (e) => { e.preventDefault(); this.setFocusOpen(!this.focusOpen); });
     this.buildToolbar();
     this.buildSelBar();
 
@@ -957,6 +963,7 @@ class Editor {
     this.btn(g3, 'plus', 'Add page', () => this.addPage());
     this.btn(g3, 'layout-dashboard|layout-grid', 'All pages', () => this.openOverview());
     const g4 = el('div', 'inkbook-group', right);
+    this.focusBtn = this.btn(g4, 'maximize-2|maximize|expand', 'Full screen writing', () => this.setFocus(!this.focusMode));
     this.btn(g4, 'settings|settings-2', 'Settings: page style and pencil options', (e) => this.settingsMenu(e));
     this.btn(g4, 'more-horizontal|more-vertical', 'More', (e) => this.moreMenu(e));
     this.refreshToolbar();
@@ -1011,7 +1018,53 @@ class Editor {
       });
     }
     this.refreshState();
+    this.refreshFab();
     this.fitToolbar();
+  }
+
+  /* ---------------- full-screen writing ---------------- */
+
+  /* The page fills the whole screen, zoomed to its width, and the toolbar folds into a corner
+     button. The editor is moved onto the document body so nothing of Obsidian's shows around it. */
+  setFocus(on) {
+    if (on === this.focusMode) return;
+    if (this.turnState) this.finishTurn();
+    this.closeColors();
+    const ch0 = this.stage.clientHeight, mid = (ch0 / 2 - this.ty) / this.scale;  // page spot at mid-screen
+    this.focusMode = on; this.focusOpen = false;
+    (on ? document.body : this.home).appendChild(this.root);
+    this.root.classList.toggle('is-focus', on);
+    this.root.classList.remove('is-open');
+    this.focusBtn.setAttribute('aria-label', on ? 'Leave full screen' : 'Full screen writing');
+    this.focusBtn.title = this.focusBtn.getAttribute('aria-label');
+    this.host.setIcon(this.focusBtn, on ? 'minimize-2|minimize|shrink' : 'maximize-2|maximize|expand');
+    this.refreshFab();
+    // Zoom to the new width and keep the same part of the page in the middle of the screen.
+    this.fit();
+    this.ty = this.stage.clientHeight / 2 - mid * this.scale;
+    this.clampPan(); this.applyTransform(); this.render();
+    this.root.focus({ preventScroll: true });
+    this.fitToolbar();
+  }
+
+  setFocusOpen(open) {
+    this.focusOpen = open;
+    this.root.classList.toggle('is-open', open);
+    if (!open) this.closeColors();
+    this.refreshFab();
+    this.fitToolbar();
+  }
+
+  /* The corner button shows the tool in hand, ringed in its colour; while unfolded, an arrow to fold it. */
+  refreshFab() {
+    if (!this.fab) return;
+    const p = this.prefs, t = TOOLS.find((x) => x[0] === p.tool) || TOOLS[0];
+    const ink = p.tool === 'pen' ? p.penColor : p.tool === 'highlighter' ? p.hlColor : 'transparent';
+    this.host.setIcon(this.fab, this.focusOpen ? 'chevron-up' : t[1]);
+    this.fab.style.setProperty('--ink', this.focusOpen ? 'transparent' : ink);
+    const label = this.focusOpen ? 'Hide toolbar' : 'Show toolbar (' + t[2].split(' (')[0] + ')';
+    this.fab.setAttribute('aria-label', label); this.fab.title = label;
+    this.fab.setAttribute('aria-expanded', String(this.focusOpen));
   }
 
   /* Swatches are plain <div>s: themes restyle <button>s (padding, minimum sizes), which squashed
@@ -1041,8 +1094,15 @@ class Editor {
     custom.setAttribute('aria-label', 'Custom colour');
     custom.addEventListener('change', () => this.setColor(custom.value));
     const r = anchor.getBoundingClientRect(), rr = this.root.getBoundingClientRect();
-    pop.style.top = r.bottom - rr.top + 6 + 'px';
-    pop.style.left = clamp(r.left - rr.left - 8, 4, Math.max(4, rr.width - pop.offsetWidth - 4)) + 'px';
+    if (this.focusMode && this.focusOpen) {
+      // Toolbar is a strip down the right edge: open the colours to its left.
+      const strip = this.toolbar.getBoundingClientRect();
+      pop.style.left = Math.max(4, strip.left - rr.left - pop.offsetWidth - 8) + 'px';
+      pop.style.top = clamp(r.top - rr.top - 8, 4, Math.max(4, rr.height - pop.offsetHeight - 4)) + 'px';
+    } else {
+      pop.style.top = r.bottom - rr.top + 6 + 'px';
+      pop.style.left = clamp(r.left - rr.left - 8, 4, Math.max(4, rr.width - pop.offsetWidth - 4)) + 'px';
+    }
     this.popOff = (e) => { if (!pop.contains(e.target) && !anchor.contains(e.target)) this.closeColors(); };
     setTimeout(() => document.addEventListener('pointerdown', this.popOff, true));
   }
@@ -1154,16 +1214,32 @@ class Editor {
      own above the rest. */
   fitToolbar() {
     const z = this.toolbar.children, W = this.toolbar.clientWidth;
+    if (this.focusMode && this.focusOpen) { this.fitStrip(); return; }
+    this.toolbar.style.gridTemplateRows = '';
     if (!W || z.length < 3) return;
+    // Measure each zone on one line: a zone that has already wrapped would report its squeezed width.
+    this.root.classList.add('is-measuring');
     const L = z[0].scrollWidth, M = z[1].scrollWidth, R = z[2].scrollWidth;
+    this.root.classList.remove('is-measuring');
     const centred = W >= 2 * Math.max(L, R) + M + 40, oneRow = W >= L + M + R + 40;
     this.root.classList.toggle('is-squeezed', !centred && oneRow);
     this.root.classList.toggle('is-narrow', !oneRow);
   }
 
+  /* Full-screen toolbar: one column of buttons down the right edge, under the corner button. If the
+     screen is too short for them all, the rest continue in a second column beside it. */
+  fitStrip() {
+    const t = this.toolbar, items = t.querySelectorAll('.inkbook-group > *');
+    let n = 0;
+    for (const b of items) if (b.style.display !== 'none') n++;
+    const room = this.root.clientHeight - (t.offsetTop || 60) - 16;
+    const rows = Math.max(4, Math.min(n, Math.floor((room - 12) / 44)));
+    t.style.gridTemplateRows = `repeat(${rows}, 40px)`;
+  }
+
   fit() {
     const cw = this.stage.clientWidth;
-    this.scale = Math.min((cw - 24) / this.nb.w, 1.8);
+    this.scale = Math.min((cw - (this.focusMode ? 8 : 24)) / this.nb.w, this.focusMode ? 2.5 : 1.8);
     this.tx = (cw - this.nb.w * this.scale) / 2;
     this.ty = 12;
     this.clampPan();
@@ -1580,7 +1656,8 @@ class Editor {
     if (this.inTextEditor(e.target)) return;
     const mod = e.ctrlKey || e.metaKey, k = e.key.toLowerCase();
     let done = true;
-    if (mod && k === 'z') e.shiftKey ? this.redo() : this.undo();
+    if (k === 'escape' && this.focusMode) this.focusOpen ? this.setFocusOpen(false) : this.setFocus(false);
+    else if (mod && k === 'z') e.shiftKey ? this.redo() : this.undo();
     else if (mod && k === 'y') this.redo();
     else if (mod && k === 'v') {
       // Let the browser's paste event come through (it may carry a PDF); fall back to ink paste.
@@ -3111,6 +3188,13 @@ class InkbookPlugin extends obsidian.Plugin {
       }
     }));
     this.addSettingTab(new InkbookSettingTab(this.app, this));
+    // A notebook in full-screen writing covers everything; leave it when another tab takes over.
+    this.registerEvent(this.app.workspace.on('active-leaf-change', (leaf) => {
+      for (const l of this.app.workspace.getLeavesOfType(VIEW_TYPE)) {
+        const ed = l.view && l.view.editor;
+        if (l !== leaf && ed && ed.focusMode) ed.setFocus(false);
+      }
+    }));
     this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
       const all = this.settings.positions;
       if (all && all[oldPath]) { all[file.path] = all[oldPath]; delete all[oldPath]; this.saveSettingsSoon(); }
