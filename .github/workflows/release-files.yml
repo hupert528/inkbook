@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Tag of the release to fix (for example 0.1.7)
+        description: Tag of the release to fix (for example 1.1.1)
         required: true
 
 permissions:
@@ -32,6 +32,14 @@ jobs:
           node --check main.js
           head -c 40 main.js | grep -q "use strict"
           node -e "const m = require('./manifest.json'); if (m.id !== 'inkbook') throw new Error('bad manifest')"
+
+      - name: Check the tag matches the manifest version
+        run: |
+          node -e "
+            const m = require('./manifest.json'), v = require('./versions.json'), tag = process.env.TAG;
+            if (m.version !== tag) throw new Error('Release tag ' + tag + ' does not match manifest.json version ' + m.version + '. Make a release tagged ' + m.version + ' instead.');
+            if (!v[m.version]) throw new Error('versions.json has no entry for ' + m.version);
+          "
 
       - name: Remove wrongly named copies
         run: |
