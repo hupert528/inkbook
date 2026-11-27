@@ -5,8 +5,11 @@ Everything stored locally and/or in cloud
 
 ## Install
 
-1 -  Install BRAT in community plugins on obsidian and enabl
+1 - Install BRAT in community plugins on Obsidian and enable it
 2 - Copy the repository link into BRAT install
+
+Once Inkbook is accepted into Obsidian's community plugins, it can be installed straight from
+Settings → Community plugins → Browse instead.
 
 
 
@@ -60,3 +63,13 @@ Defaults (page style, stabilisation strength, pressure, finger drawing…) are i
 
 `dev/index.html` runs the drawing engine in a normal browser with the Obsidian API stubbed out
 (serve the `inkbook` folder with `python -m http.server`). It is not needed for the plugin.
+
+## Releasing a new version
+
+1. Raise `version` in `manifest.json` (for example `1.1.1` → `1.1.2`) and add the same version to
+   `versions.json` with the lowest Obsidian version it needs.
+2. Merge into `main`.
+3. On GitHub, create a **new** release whose tag is exactly that version (no "v"). The release
+   Action attaches `main.js`, `manifest.json` and `styles.css` and refuses if the tag and manifest
+   version differ, since Obsidian and BRAT both rely on them matching. Editing an old release
+   does not re-run it.
